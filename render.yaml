@@ -1,14 +1,46 @@
-services:
-  - type: web
-    name: your-app-name
-    env: python
-    runtime:
-      version: 3.13.4
-    region: singapore  # or your preferred region
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
-    envVars:
-      - key: BINANCE_API_KEY
-        value: your_api_key_here
-      - key: BINANCE_API_SECRET
-        value: your_api_secret_here
+# render.yaml
+runtime:
+  python: 3.13.4
+
+# Define the service
+service:
+  name: crypto-trading-bot
+  region: oregon  # Change to your preferred region
+  plan: free  # Change to paid plan if needed
+  env:
+    - key: BINANCE_API_KEY
+      value: ${BINANCE_API_KEY}
+    - key: BINANCE_API_SECRET
+      value: ${BINANCE_API_SECRET}
+    - key: TELEGRAM_BOT_TOKEN
+      value: ${TELEGRAM_BOT_TOKEN}
+    - key: TELEGRAM_CHAT_ID
+      value: ${TELEGRAM_CHAT_ID}
+    - key: INITIAL_BALANCE
+      value: "10000"
+    - key: POSITION_SIZE_USD
+      value: "100"
+    - key: LEVERAGE
+      value: "10"
+    - key: MAX_TRADES_PER_ALGO
+      value: "2"
+    - key: PORT
+      value: "8000"
+    - key: DATA_UPDATE_INTERVAL
+      value: "60"
+    - key: STOP_LOSS_PERCENT
+      value: "2.0"
+    - key: TAKE_PROFIT_PERCENT
+      value: "3.0"
+
+# Define the web service
+web:
+  run: hypercorn main:app --workers 1 --bind 0.0.0.0:8000 --reload
+  port: 8000
+  healthcheck:
+    path: /health
+    check_interval: 30
+    timeout: 5
+    timeout_interval: 10
+    healthy_threshold: 2
+    unhealthy_threshold: 5
