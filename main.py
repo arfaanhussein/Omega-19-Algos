@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Complete Crypto Futures Trading Bot v3.0
-Single file implementation with Telegram, Enhanced Dashboard, and Multi-API Support
+Professional Crypto Futures Trading Bot v4.0
+Binance Global Only - Fixed PnL - Extensive Dashboard
+Single file implementation with all requirements
 """
 
 import os
@@ -10,7 +11,6 @@ import time
 import json
 import uuid
 import random
-import pickle
 import logging
 import requests
 import threading
@@ -33,10 +33,9 @@ load_dotenv()
 # ======================== CONFIGURATION ========================
 class Config:
     """Central configuration from environment variables"""
-    # API Keys
+    # Binance Global API (NOT Binance.US)
     BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
     BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
-    COINGECKO_API_KEY = os.getenv('COINGECKO_API_KEY', '')
     
     # Telegram
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -49,56 +48,34 @@ class Config:
     LEVERAGE = int(os.getenv('LEVERAGE', '10'))
     MAX_TRADES_PER_ALGO = int(os.getenv('MAX_TRADES_PER_ALGO', '2'))
     
-    # API Rate Limits
-    COINGECKO_MAX_REQUESTS_PER_MIN = int(os.getenv('COINGECKO_MAX_REQUESTS_PER_MIN', '10'))
-    BINANCE_MAX_REQUESTS_PER_MIN = int(os.getenv('BINANCE_MAX_REQUESTS_PER_MIN', '1200'))
-    
     # System
-    PORT = int(os.getenv('PORT', '5000'))
-    DATA_UPDATE_INTERVAL = int(os.getenv('DATA_UPDATE_INTERVAL', '30'))
-    BALANCE_FILE = os.getenv('BALANCE_FILE', 'balance.pkl')
-    LOG_FILE = os.getenv('LOG_FILE', 'trading_bot.json')
+    PORT = int(os.getenv('PORT', '10000'))
+    DATA_UPDATE_INTERVAL = int(os.getenv('DATA_UPDATE_INTERVAL', '5'))
+    BALANCE_FILE = 'data/balance.json'
     
     # Risk Management
     STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', '2.0'))
     TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', '3.0'))
+    
+    # Binance Rate Limits
+    BINANCE_MAX_REQUESTS_PER_MIN = 1200
+    BINANCE_WEIGHT_PER_MIN = 6000
 
-# ======================== STRUCTURED LOGGING ========================
-class JSONLogger:
-    """Structured JSON logging for all events"""
-    def __init__(self, filename='trading_bot.json'):
-        self.filename = filename
-        self.lock = Lock()
-        
-    def log(self, event_type: str, data: Dict[str, Any]):
-        """Log event to JSON file"""
-        with self.lock:
-            log_entry = {
-                'timestamp': datetime.now().isoformat(),
-                'event_type': event_type,
-                'data': data
-            }
-            try:
-                with open(self.filename, 'a') as f:
-                    f.write(json.dumps(log_entry) + '\n')
-            except Exception as e:
-                print(f"Failed to write log: {e}")
+# Create data directory if not exists
+os.makedirs('data', exist_ok=True)
 
-# Initialize JSON logger
-json_logger = JSONLogger(Config.LOG_FILE)
-
-# Standard logging setup
+# ======================== LOGGING ========================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('trading_bot.log')
+        logging.FileHandler('data/trading_bot.log')
     ]
 )
 logger = logging.getLogger(__name__)
 
-# ======================== TELEGRAM INTEGRATION ========================
+# ======================== TELEGRAM ========================
 class TelegramBot:
     """Telegram bot for notifications"""
     def __init__(self, token: str, chat_id: str):
@@ -111,17 +88,10 @@ class TelegramBot:
         """Send message to Telegram"""
         if not self.enabled:
             return
-        
         try:
             url = f"{self.base_url}/sendMessage"
-            data = {
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': parse_mode
-            }
+            data = {'chat_id': self.chat_id, 'text': message, 'parse_mode': parse_mode}
             response = requests.post(url, data=data, timeout=5)
-            if response.status_code != 200:
-                logger.error(f"Telegram send failed: {response.text}")
         except Exception as e:
             logger.error(f"Telegram error: {e}")
     
@@ -136,72 +106,112 @@ class TelegramBot:
         if pnl is not None:
             pnl_emoji = "💰" if pnl > 0 else "📉"
             message += f"P&L: {pnl_emoji} ${pnl:+.2f}"
-        
-        self.send_message(message)
-    
-    def send_daily_report(self, stats: Dict):
-        """Send daily performance report"""
-        message = "<b>📊 Daily Trading Report</b>\n\n"
-        message += f"Total P&L: ${stats.get('total_pnl', 0):+.2f}\n"
-        message += f"Win Rate: {stats.get('win_rate', 0):.1f}%\n"
-        message += f"Total Trades: {stats.get('total_trades', 0)}\n"
-        message += f"Open Positions: {stats.get('open_positions', 0)}\n"
-        message += f"Account Balance: ${stats.get('balance', 0):.2f}\n"
-        
         self.send_message(message)
 
-# Initialize Telegram bot
 telegram_bot = TelegramBot(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
 
-# ======================== RATE LIMITER ========================
-class RateLimiter:
-    """Rate limiter for API calls"""
-    def __init__(self, max_requests: int, time_window: int = 60):
-        self.max_requests = max_requests
-        self.time_window = time_window
+# ======================== BINANCE RATE LIMITER ========================
+class BinanceRateLimiter:
+    """Advanced rate limiter for Binance Global API"""
+    def __init__(self):
+        self.requests_per_min = Config.BINANCE_MAX_REQUESTS_PER_MIN
+        self.weight_per_min = Config.BINANCE_WEIGHT_PER_MIN
         self.requests = deque()
+        self.weights = deque()
         self.lock = Lock()
-    
-    def can_make_request(self) -> bool:
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.last_reset = time.time()
+        
+    def can_make_request(self, weight: int = 1) -> bool:
         """Check if request can be made"""
         with self.lock:
             now = time.time()
-            # Remove old requests
-            while self.requests and self.requests[0] < now - self.time_window:
-                self.requests.popleft()
             
-            if len(self.requests) < self.max_requests:
+            # Remove old requests/weights (older than 1 minute)
+            while self.requests and self.requests[0] < now - 60:
+                self.requests.popleft()
+            while self.weights and self.weights[0][0] < now - 60:
+                self.weights.popleft()
+            
+            # Calculate current usage
+            current_requests = len(self.requests)
+            current_weight = sum(w[1] for w in self.weights)
+            
+            # Check limits
+            if current_requests < self.requests_per_min and current_weight + weight <= self.weight_per_min:
                 self.requests.append(now)
+                self.weights.append((now, weight))
+                self.total_requests += 1
                 return True
             return False
     
-    def wait_if_needed(self):
+    def wait_if_needed(self, weight: int = 1):
         """Wait if rate limit exceeded"""
-        while not self.can_make_request():
+        while not self.can_make_request(weight):
             time.sleep(0.1)
+    
+    def get_stats(self) -> Dict:
+        """Get rate limiter statistics"""
+        with self.lock:
+            now = time.time()
+            # Clean old entries
+            while self.requests and self.requests[0] < now - 60:
+                self.requests.popleft()
+            while self.weights and self.weights[0][0] < now - 60:
+                self.weights.popleft()
+            
+            current_requests = len(self.requests)
+            current_weight = sum(w[1] for w in self.weights)
+            
+            return {
+                'requests_used': current_requests,
+                'requests_limit': self.requests_per_min,
+                'weight_used': current_weight,
+                'weight_limit': self.weight_per_min,
+                'total_requests': self.total_requests,
+                'success_rate': (self.successful_requests / max(self.total_requests, 1)) * 100,
+                'requests_remaining': self.requests_per_min - current_requests,
+                'reset_in': 60 - (now - self.requests[0]) if self.requests else 60
+            }
 
 # ======================== DATA CACHE ========================
-class DataCache:
-    """Cache for market data"""
-    def __init__(self, ttl: int = 30):
+class MarketDataCache:
+    """Smart caching for market data"""
+    def __init__(self, ttl: int = 5):
         self.cache = {}
         self.ttl = ttl
         self.lock = Lock()
-    
+        self.hits = 0
+        self.misses = 0
+        
     def get(self, key: str) -> Optional[Any]:
         """Get cached data if not expired"""
         with self.lock:
             if key in self.cache:
                 data, timestamp = self.cache[key]
                 if time.time() - timestamp < self.ttl:
+                    self.hits += 1
                     return data
                 del self.cache[key]
+            self.misses += 1
         return None
     
     def set(self, key: str, value: Any):
         """Set cache data"""
         with self.lock:
             self.cache[key] = (value, time.time())
+    
+    def get_stats(self) -> Dict:
+        """Get cache statistics"""
+        total = self.hits + self.misses
+        return {
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': (self.hits / max(total, 1)) * 100,
+            'cached_items': len(self.cache)
+        }
 
 # ======================== MODELS ========================
 class OrderStatus(Enum):
@@ -307,10 +317,11 @@ class Position:
     take_profit: Optional[float] = None
     
     def update_pnl(self, current_price: float):
+        """Update unrealized PnL based on current price"""
         self.current_price = current_price
-        if self.quantity > 0:
+        if self.quantity > 0:  # Long position
             self.unrealized_pnl = (current_price - self.entry_price) * self.quantity
-        else:
+        else:  # Short position
             self.unrealized_pnl = (self.entry_price - current_price) * abs(self.quantity)
 
 @dataclass
@@ -354,42 +365,52 @@ class AlgorithmState:
 
 # ======================== BALANCE MANAGER ========================
 class BalanceManager:
-    """Persistent balance management"""
+    """Persistent balance management with disk storage"""
     def __init__(self, initial_balance: float = 10000.0):
         self.lock = Lock()
         self.balance_file = Config.BALANCE_FILE
-        self.balance = self._load_balance(initial_balance)
         self.initial_balance = initial_balance
-        self.equity_history = []
-        self.last_save_time = time.time()
-    
-    def _load_balance(self, initial_balance: float) -> float:
+        self.balance_data = self._load_balance()
+        self.balance = self.balance_data.get('balance', initial_balance)
+        self.equity_history = self.balance_data.get('equity_history', [])
+        self.max_drawdown = self.balance_data.get('max_drawdown', 0)
+        self.peak_balance = self.balance_data.get('peak_balance', initial_balance)
+        
+    def _load_balance(self) -> Dict:
         """Load balance from disk"""
         try:
             if os.path.exists(self.balance_file):
-                with open(self.balance_file, 'rb') as f:
-                    data = pickle.load(f)
-                    logger.info(f"Loaded balance: ${data['balance']:.2f}")
-                    self.equity_history = data.get('equity_history', [])
-                    return data['balance']
+                with open(self.balance_file, 'r') as f:
+                    data = json.load(f)
+                    logger.info(f"Loaded balance from disk: ${data.get('balance', 0):.2f}")
+                    return data
         except Exception as e:
             logger.error(f"Failed to load balance: {e}")
-        return initial_balance
+        
+        # Return default if no file exists
+        return {
+            'balance': self.initial_balance,
+            'equity_history': [],
+            'max_drawdown': 0,
+            'peak_balance': self.initial_balance,
+            'created_at': datetime.now().isoformat()
+        }
     
     def save_balance(self):
         """Save balance to disk"""
         with self.lock:
             try:
-                data = {
+                self.balance_data = {
                     'balance': self.balance,
                     'equity_history': self.equity_history[-1000:],  # Keep last 1000 points
-                    'timestamp': datetime.now().isoformat()
+                    'max_drawdown': self.max_drawdown,
+                    'peak_balance': self.peak_balance,
+                    'last_updated': datetime.now().isoformat()
                 }
-                with open(self.balance_file, 'wb') as f:
-                    pickle.dump(data, f)
                 
-                # Save periodically, not every update
-                self.last_save_time = time.time()
+                with open(self.balance_file, 'w') as f:
+                    json.dump(self.balance_data, f, indent=2)
+                    
             except Exception as e:
                 logger.error(f"Failed to save balance: {e}")
     
@@ -397,210 +418,127 @@ class BalanceManager:
         """Update balance with P&L"""
         with self.lock:
             self.balance += pnl
+            
+            # Update peak and drawdown
+            if self.balance > self.peak_balance:
+                self.peak_balance = self.balance
+            
+            drawdown = ((self.peak_balance - self.balance) / self.peak_balance) * 100 if self.peak_balance > 0 else 0
+            self.max_drawdown = max(self.max_drawdown, drawdown)
+            
+            # Add to history
             self.equity_history.append({
                 'timestamp': datetime.now().isoformat(),
                 'balance': self.balance,
-                'pnl': pnl
+                'pnl': pnl,
+                'drawdown': drawdown
             })
             
-            # Save every 60 seconds
-            if time.time() - self.last_save_time > 60:
-                self.save_balance()
+            # Save to disk
+            self.save_balance()
     
     def get_balance(self) -> float:
         """Get current balance"""
         with self.lock:
             return self.balance
     
-    def get_equity_history(self) -> List[Dict]:
-        """Get equity history for charts"""
+    def get_stats(self) -> Dict:
+        """Get balance statistics"""
         with self.lock:
-            return self.equity_history.copy()
+            return {
+                'balance': self.balance,
+                'initial_balance': self.initial_balance,
+                'peak_balance': self.peak_balance,
+                'max_drawdown': self.max_drawdown,
+                'equity_history': self.equity_history.copy()
+            }
 
-# ======================== MARKET DATA PROVIDERS ========================
-class CoinGeckoProvider:
-    """CoinGecko API data provider"""
+# ======================== BINANCE MARKET DATA ========================
+class BinanceMarketData:
+    """Binance Global market data provider with smart caching"""
     def __init__(self):
-        self.base_url = "https://api.coingecko.com/api/v3"
-        self.api_key = Config.COINGECKO_API_KEY
-        self.rate_limiter = RateLimiter(Config.COINGECKO_MAX_REQUESTS_PER_MIN)
-        self.cache = DataCache(ttl=30)
-        self.crypto_ids = {
-            'bitcoin': 'BTC-PERP', 'ethereum': 'ETH-PERP', 
-            'binancecoin': 'BNB-PERP', 'solana': 'SOL-PERP',
-            'ripple': 'XRP-PERP', 'cardano': 'ADA-PERP',
-            'avalanche-2': 'AVAX-PERP', 'polkadot': 'DOT-PERP',
-            'polygon': 'MATIC-PERP', 'chainlink': 'LINK-PERP'
-        }
-        self.last_prices = {}
-    
-    def get_market_data(self) -> List[MarketData]:
-        """Get market data from CoinGecko"""
+        self.base_url = "https://api.binance.com/api/v3"
+        self.rate_limiter = BinanceRateLimiter()
+        self.cache = MarketDataCache(ttl=5)
+        self.symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+                       'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT']
+        self.last_request_time = {}
+        self.circuit_breaker_active = False
+        self.consecutive_failures = 0
+        
+    def batch_get_market_data(self) -> List[MarketData]:
+        """Get market data for all symbols in one batch request"""
         # Check cache first
-        cached_data = self.cache.get('market_data')
+        cached_data = self.cache.get('batch_market_data')
         if cached_data:
             return cached_data
         
-        # Rate limit check
-        self.rate_limiter.wait_if_needed()
+        # Check circuit breaker
+        if self.circuit_breaker_active:
+            if self.consecutive_failures < 3:
+                self.circuit_breaker_active = False
+            else:
+                return []
         
         try:
-            headers = {'x-cg-pro-api-key': self.api_key} if self.api_key else {}
-            ids = ','.join(self.crypto_ids.keys())
-            url = f"{self.base_url}/simple/price"
-            params = {
-                'ids': ids,
-                'vs_currencies': 'usd',
-                'include_24hr_change': 'true',
-                'include_24hr_vol': 'true'
-            }
+            # Use batch endpoint for efficiency (weight: 40)
+            self.rate_limiter.wait_if_needed(weight=40)
             
-            response = requests.get(url, params=params, headers=headers, timeout=10)
+            url = f"{self.base_url}/ticker/24hr"
+            response = requests.get(url, timeout=10)
             
             if response.status_code == 200:
-                data = response.json()
+                all_data = response.json()
                 market_data_list = []
                 
-                for coin_id, symbol in self.crypto_ids.items():
-                    if coin_id in data:
-                        coin_data = data[coin_id]
-                        price = coin_data.get('usd', 0)
-                        volume = coin_data.get('usd_24h_vol', 0)
-                        change = coin_data.get('usd_24h_change', 0)
-                        
-                        open_price = self.last_prices.get(symbol, price)
-                        self.last_prices[symbol] = price
-                        
+                # Filter for our symbols
+                for ticker in all_data:
+                    if ticker['symbol'] in self.symbols:
                         market_data = MarketData(
-                            symbol=symbol,
-                            price=price,
-                            volume=volume if volume else 1000000,
+                            symbol=ticker['symbol'].replace('USDT', '-PERP'),
+                            price=float(ticker['lastPrice']),
+                            volume=float(ticker['volume']),
                             timestamp=datetime.now(),
-                            bid=price * 0.9999,
-                            ask=price * 1.0001,
-                            open=open_price,
-                            high=price * (1 + abs(change/200)),
-                            low=price * (1 - abs(change/200)),
-                            close=price
+                            bid=float(ticker['bidPrice']),
+                            ask=float(ticker['askPrice']),
+                            open=float(ticker['openPrice']),
+                            high=float(ticker['highPrice']),
+                            low=float(ticker['lowPrice']),
+                            close=float(ticker['lastPrice'])
                         )
                         market_data_list.append(market_data)
                 
                 # Cache the data
-                self.cache.set('market_data', market_data_list)
+                self.cache.set('batch_market_data', market_data_list)
+                self.rate_limiter.successful_requests += 1
+                self.consecutive_failures = 0
+                
                 return market_data_list
             else:
-                logger.warning(f"CoinGecko API error: {response.status_code}")
-                return []
+                self.rate_limiter.failed_requests += 1
+                self.consecutive_failures += 1
+                logger.warning(f"Binance API error: {response.status_code}")
                 
         except Exception as e:
-            logger.error(f"CoinGecko error: {e}")
-            return []
-
-class BinanceProvider:
-    """Binance API data provider (fallback)"""
-    def __init__(self):
-        self.base_url = "https://api.binance.com/api/v3"
-        self.api_key = Config.BINANCE_API_KEY
-        self.api_secret = Config.BINANCE_API_SECRET
-        self.rate_limiter = RateLimiter(Config.BINANCE_MAX_REQUESTS_PER_MIN)
-        self.cache = DataCache(ttl=10)
-        self.symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-                       'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT']
-    
-    def get_market_data(self) -> List[MarketData]:
-        """Get market data from Binance"""
-        # Check cache first
-        cached_data = self.cache.get('binance_data')
-        if cached_data:
-            return cached_data
-        
-        # Rate limit check
-        self.rate_limiter.wait_if_needed()
-        
-        try:
-            market_data_list = []
-            
-            for symbol in self.symbols:
-                url = f"{self.base_url}/ticker/24hr"
-                params = {'symbol': symbol}
-                
-                response = requests.get(url, params=params, timeout=5)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    
-                    # Get orderbook for bid/ask
-                    book_url = f"{self.base_url}/depth"
-                    book_params = {'symbol': symbol, 'limit': 5}
-                    book_response = requests.get(book_url, params=book_params, timeout=5)
-                    
-                    bid = float(data['bidPrice'])
-                    ask = float(data['askPrice'])
-                    
-                    if book_response.status_code == 200:
-                        book_data = book_response.json()
-                        if book_data['bids']:
-                            bid = float(book_data['bids'][0][0])
-                        if book_data['asks']:
-                            ask = float(book_data['asks'][0][0])
-                    
-                    market_data = MarketData(
-                        symbol=symbol.replace('USDT', '-PERP'),
-                        price=float(data['lastPrice']),
-                        volume=float(data['volume']),
-                        timestamp=datetime.now(),
-                        bid=bid,
-                        ask=ask,
-                        open=float(data['openPrice']),
-                        high=float(data['highPrice']),
-                        low=float(data['lowPrice']),
-                        close=float(data['lastPrice'])
-                    )
-                    market_data_list.append(market_data)
-            
-            # Cache the data
-            self.cache.set('binance_data', market_data_list)
-            return market_data_list
-            
-        except Exception as e:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= 3:
+                self.circuit_breaker_active = True
             logger.error(f"Binance error: {e}")
-            return []
-
-class MarketDataManager:
-    """Manages market data from multiple sources"""
-    def __init__(self):
-        self.coingecko = CoinGeckoProvider()
-        self.binance = BinanceProvider()
-        self.use_binance = False
-        self.failure_count = 0
+        
+        return []
     
-    def get_market_data(self) -> List[MarketData]:
-        """Get market data with fallback"""
-        # Try CoinGecko first
-        if not self.use_binance:
-            data = self.coingecko.get_market_data()
-            if data:
-                self.failure_count = 0
-                return data
-            else:
-                self.failure_count += 1
-                if self.failure_count >= 3:
-                    logger.warning("Switching to Binance due to CoinGecko failures")
-                    self.use_binance = True
-        
-        # Fallback to Binance
-        data = self.binance.get_market_data()
-        if data:
-            return data
-        
-        # If Binance also fails, try CoinGecko again
-        self.use_binance = False
-        self.failure_count = 0
-        return self.coingecko.get_market_data()
+    def get_stats(self) -> Dict:
+        """Get market data provider statistics"""
+        return {
+            'cache_stats': self.cache.get_stats(),
+            'rate_limiter_stats': self.rate_limiter.get_stats(),
+            'circuit_breaker': self.circuit_breaker_active,
+            'consecutive_failures': self.consecutive_failures
+        }
 
 # ======================== TRADING ENGINE ========================
 class TradingAlgorithm:
-    """Base trading algorithm"""
+    """Base trading algorithm - NO CHANGES TO LOGIC"""
     def __init__(self, algorithm_id: str, name: str):
         self.algorithm_id = algorithm_id
         self.name = name
@@ -611,37 +549,37 @@ class TradingAlgorithm:
         )
     
     def should_trade(self, market_data: MarketData) -> Optional[str]:
-        """Determine if should trade"""
+        """Original trading logic - UNCHANGED"""
         if random.random() > 0.95:  # 5% chance to trade
             return 'long' if random.random() > 0.5 else 'short'
         return None
     
     def should_exit(self, position: Position, current_price: float) -> bool:
-        """Determine if should exit position"""
+        """Original exit logic - UNCHANGED"""
         if position.quantity > 0:  # Long position
             pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100
         else:  # Short position
             pnl_pct = ((position.entry_price - current_price) / position.entry_price) * 100
         
-        # Check stop loss and take profit
         return (pnl_pct <= -Config.STOP_LOSS_PERCENT or 
                 pnl_pct >= Config.TAKE_PROFIT_PERCENT)
 
 class TradingEngine:
-    """Main trading engine"""
+    """Main trading engine - LOGIC UNCHANGED, PNL FIXES APPLIED"""
     def __init__(self):
         self.is_running = False
         self.algorithms = []
         self.positions = {}
         self.trades = {}
+        self.closed_trades = []  # Track closed trades separately
         self.market_data_queue = deque(maxlen=1000)
         self.lock = Lock()
         self.balance_manager = BalanceManager(Config.INITIAL_BALANCE)
-        self.market_data_manager = MarketDataManager()
+        self.market_data_provider = BinanceMarketData()
         
-        # P&L tracking
-        self.total_realized_pnl = 0.0
-        self.total_unrealized_pnl = 0.0
+        # Fixed P&L tracking
+        self.total_realized_pnl = 0.0  # Sum of closed trades
+        self.total_unrealized_pnl = 0.0  # Sum of open positions
         
         # Statistics
         self.total_wins = 0
@@ -652,12 +590,16 @@ class TradingEngine:
         self._create_algorithms()
         
         logger.info(f"✅ Trading Engine initialized with {len(self.algorithms)} algorithms")
-        telegram_bot.send_message("🚀 Trading Bot Started\n" + 
-                                 f"Balance: ${self.balance_manager.get_balance():.2f}\n" +
-                                 f"Algorithms: {len(self.algorithms)}")
+        logger.info(f"💰 Starting balance: ${self.balance_manager.get_balance():.2f}")
+        
+        telegram_bot.send_message(
+            "🚀 Trading Bot Started\n" + 
+            f"Balance: ${self.balance_manager.get_balance():.2f}\n" +
+            f"Algorithms: {len(self.algorithms)}"
+        )
     
     def _create_algorithms(self):
-        """Create 19 trading algorithms"""
+        """Create 19 trading algorithms - UNCHANGED"""
         strategies = [
             "BTC Moving Average Crossover", "ETH RSI Oversold/Overbought", 
             "BTC MACD Signal", "Bollinger Bands Multi-Crypto",
@@ -676,38 +618,57 @@ class TradingEngine:
             self.algorithms.append(algo)
     
     def get_active_algorithm(self) -> Optional[TradingAlgorithm]:
-        """Get next active algorithm"""
+        """Get next active algorithm - UNCHANGED"""
         for algo in self.algorithms:
             if algo.state.can_trade():
                 return algo
         return None
     
-    def calculate_live_pnl(self) -> float:
-        """Calculate total P&L"""
+    def calculate_live_pnl(self) -> Dict:
+        """FIXED: Calculate accurate P&L"""
+        # Calculate unrealized P&L from open positions
         total_unrealized = 0.0
         
         for position in self.positions.values():
-            # Find latest price
-            latest_price = None
+            # Get latest price for this position
+            latest_price = position.current_price
+            
+            # Find most recent price from market data
             for data in reversed(list(self.market_data_queue)):
                 if data.symbol == position.symbol:
                     latest_price = data.price
+                    position.current_price = latest_price  # Update position's current price
                     break
             
-            if latest_price:
-                position.update_pnl(latest_price)
-                total_unrealized += position.unrealized_pnl
+            # Calculate unrealized P&L
+            if position.quantity > 0:  # Long position
+                position.unrealized_pnl = (latest_price - position.entry_price) * position.quantity
+            else:  # Short position
+                position.unrealized_pnl = (position.entry_price - latest_price) * abs(position.quantity)
+            
+            total_unrealized += position.unrealized_pnl
+        
+        # Calculate realized P&L from closed trades
+        total_realized = sum(trade.pnl for trade in self.closed_trades)
         
         self.total_unrealized_pnl = total_unrealized
-        return self.total_realized_pnl + self.total_unrealized_pnl
+        self.total_realized_pnl = total_realized
+        
+        return {
+            'realized': total_realized,
+            'unrealized': total_unrealized,
+            'total': total_realized + total_unrealized
+        }
     
     def process_market_data(self, market_data: MarketData):
-        """Process incoming market data"""
+        """Process incoming market data - UNCHANGED LOGIC"""
         if not self.is_running:
             return
         
         with self.lock:
             self.market_data_queue.append(market_data)
+            
+            # Update P&L with new prices
             self.calculate_live_pnl()
             
             # Check for exits
@@ -721,7 +682,7 @@ class TradingEngine:
                     self._execute_trade(algo, market_data, direction)
     
     def _check_exits(self, market_data: MarketData):
-        """Check if positions should be closed"""
+        """Check if positions should be closed - UNCHANGED"""
         positions_to_close = []
         
         for pos_key, position in self.positions.items():
@@ -730,10 +691,8 @@ class TradingEngine:
                            if a.algorithm_id == position.algorithm_id), None)
                 
                 if algo:
-                    # Check stop loss / take profit
                     should_exit = algo.should_exit(position, market_data.price)
                     
-                    # Check manual SL/TP levels
                     if position.stop_loss and market_data.price <= position.stop_loss:
                         should_exit = True
                     if position.take_profit and market_data.price >= position.take_profit:
@@ -746,7 +705,7 @@ class TradingEngine:
             self._close_position(pos_key, market_data)
     
     def _execute_trade(self, algorithm: TradingAlgorithm, market_data: MarketData, direction: str):
-        """Execute a new trade"""
+        """Execute a new trade - UNCHANGED"""
         trade_id = str(uuid.uuid4())
         quantity = Config.POSITION_SIZE_USD / market_data.price
         quantity = round(quantity, 6)
@@ -796,43 +755,25 @@ class TradingEngine:
         algorithm.state.increment_trade_count()
         algorithm.state.trades.append(trade)
         
-        # Log trade
-        notional = quantity * market_data.price
-        margin = notional / Config.LEVERAGE
-        
         logger.info(f"🔥 TRADE EXECUTED: {algorithm.name}")
         logger.info(f"   {direction.upper()} {quantity:.6f} {market_data.symbol} @ ${market_data.price:,.2f}")
-        logger.info(f"   SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}")
         
-        # Send Telegram alert
         telegram_bot.send_trade_alert(
             "OPEN", market_data.symbol, direction.upper(),
             market_data.price, quantity
         )
-        
-        # Log to JSON
-        json_logger.log('trade_open', {
-            'trade_id': trade_id,
-            'algorithm': algorithm.name,
-            'symbol': market_data.symbol,
-            'side': direction,
-            'price': market_data.price,
-            'quantity': quantity,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit
-        })
         
         # Update daily stats
         today = datetime.now().date().isoformat()
         self.daily_stats[today]['trades'] += 1
     
     def _close_position(self, pos_key: str, market_data: MarketData):
-        """Close a position"""
+        """Close a position - FIXED PNL CALCULATION"""
         position = self.positions.get(pos_key)
         if not position:
             return
         
-        # Calculate P&L
+        # Calculate P&L correctly
         if position.quantity > 0:  # Long
             pnl = (market_data.price - position.entry_price) * position.quantity
         else:  # Short
@@ -842,9 +783,10 @@ class TradingEngine:
         for trade in position.trades:
             trade.close(market_data.price)
             trade.pnl = pnl
+            # Move to closed trades list
+            self.closed_trades.append(trade)
         
-        # Update realized P&L
-        self.total_realized_pnl += pnl
+        # Update balance
         self.balance_manager.update_balance(pnl)
         
         # Update algorithm state
@@ -859,28 +801,14 @@ class TradingEngine:
                 algo.state.loss_count += 1
                 self.total_losses += 1
             
-            price_change = ((market_data.price - position.entry_price) / position.entry_price) * 100
-            
             logger.info(f"📊 POSITION CLOSED: {algo.name}")
-            logger.info(f"   {position.symbol} {'LONG' if position.quantity > 0 else 'SHORT'}")
-            logger.info(f"   Entry: ${position.entry_price:.2f} → Exit: ${market_data.price:.2f}")
-            logger.info(f"   P&L: ${pnl:+.2f} ({price_change:+.1f}%)")
+            logger.info(f"   P&L: ${pnl:+.2f}")
         
-        # Send Telegram alert
         telegram_bot.send_trade_alert(
             "CLOSE", position.symbol,
             "LONG" if position.quantity > 0 else "SHORT",
             market_data.price, abs(position.quantity), pnl
         )
-        
-        # Log to JSON
-        json_logger.log('trade_close', {
-            'position_key': pos_key,
-            'symbol': position.symbol,
-            'exit_price': market_data.price,
-            'pnl': pnl,
-            'balance': self.balance_manager.get_balance()
-        })
         
         # Update daily stats
         today = datetime.now().date().isoformat()
@@ -888,6 +816,9 @@ class TradingEngine:
         
         # Remove position
         del self.positions[pos_key]
+        
+        # Recalculate P&L
+        self.calculate_live_pnl()
     
     def start(self):
         """Start trading engine"""
@@ -899,163 +830,260 @@ class TradingEngine:
         self.is_running = False
         self.balance_manager.save_balance()
         
-        total_pnl = self.calculate_live_pnl()
+        pnl_data = self.calculate_live_pnl()
         logger.info(f"⏹️ Trading engine stopped")
-        logger.info(f"📈 Final P&L: ${total_pnl:+.2f}")
-        
-        telegram_bot.send_message(
-            f"🛑 Trading Bot Stopped\n"
-            f"Final P&L: ${total_pnl:+.2f}\n"
-            f"Balance: ${self.balance_manager.get_balance():.2f}"
-        )
+        logger.info(f"📈 Final P&L: ${pnl_data['total']:+.2f}")
     
-    def get_status(self) -> Dict:
-        """Get comprehensive status"""
+    def get_comprehensive_status(self) -> Dict:
+        """Get comprehensive status for dashboard"""
         with self.lock:
-            total_pnl = self.calculate_live_pnl()
+            pnl_data = self.calculate_live_pnl()
+            balance_stats = self.balance_manager.get_stats()
+            
             total_trades = sum(a.state.trade_count for a in self.algorithms)
             win_rate = (self.total_wins / (self.total_wins + self.total_losses) * 100) if (self.total_wins + self.total_losses) > 0 else 0
             
+            # Get open positions data
+            open_positions = []
+            for pos_key, position in self.positions.items():
+                algo = next((a for a in self.algorithms if a.algorithm_id == position.algorithm_id), None)
+                open_positions.append({
+                    'symbol': position.symbol,
+                    'side': 'LONG' if position.quantity > 0 else 'SHORT',
+                    'quantity': abs(position.quantity),
+                    'entry_price': position.entry_price,
+                    'current_price': position.current_price,
+                    'unrealized_pnl': position.unrealized_pnl,
+                    'pnl_percent': ((position.current_price - position.entry_price) / position.entry_price * 100) if position.quantity > 0 else ((position.entry_price - position.current_price) / position.entry_price * 100),
+                    'stop_loss': position.stop_loss,
+                    'take_profit': position.take_profit,
+                    'algorithm': algo.name if algo else 'Unknown',
+                    'leverage': Config.LEVERAGE
+                })
+            
+            # Get closed trades history
+            trade_history = []
+            for trade in self.closed_trades[-50:]:  # Last 50 trades
+                algo = next((a for a in self.algorithms if a.algorithm_id == trade.algorithm_id), None)
+                trade_history.append({
+                    'symbol': trade.symbol,
+                    'side': trade.side.value if hasattr(trade.side, 'value') else str(trade.side),
+                    'entry_price': trade.entry_price,
+                    'exit_price': trade.exit_price,
+                    'pnl': trade.pnl,
+                    'entry_time': trade.entry_time.isoformat() if trade.entry_time else None,
+                    'exit_time': trade.exit_time.isoformat() if trade.exit_time else None,
+                    'algorithm': algo.name if algo else 'Unknown'
+                })
+            
+            # System stats
+            market_stats = self.market_data_provider.get_stats()
+            
             return {
-                'is_running': self.is_running,
-                'balance': self.balance_manager.get_balance(),
-                'initial_balance': Config.INITIAL_BALANCE,
-                'total_pnl': round(total_pnl, 2),
-                'realized_pnl': round(self.total_realized_pnl, 2),
-                'unrealized_pnl': round(self.total_unrealized_pnl, 2),
-                'total_trades': total_trades,
-                'open_positions': len(self.positions),
-                'win_rate': round(win_rate, 1),
+                # Balance and PnL
+                'balance': balance_stats['balance'],
+                'initial_balance': balance_stats['initial_balance'],
+                'total_pnl': pnl_data['total'],
+                'realized_pnl': pnl_data['realized'],
+                'unrealized_pnl': pnl_data['unrealized'],
+                
+                # Performance metrics
+                'roi': ((balance_stats['balance'] - balance_stats['initial_balance']) / balance_stats['initial_balance'] * 100),
+                'max_drawdown': balance_stats['max_drawdown'],
+                'peak_balance': balance_stats['peak_balance'],
+                'win_rate': win_rate,
                 'total_wins': self.total_wins,
                 'total_losses': self.total_losses,
-                'roi': round((total_pnl / Config.INITIAL_BALANCE) * 100, 2),
+                
+                # Trading stats
+                'total_trades': total_trades,
+                'open_positions_count': len(self.positions),
+                'closed_trades_count': len(self.closed_trades),
+                
+                # Detailed data
+                'open_positions': open_positions,
+                'trade_history': trade_history,
                 'algorithms': [a.state.to_dict() for a in self.algorithms],
-                'daily_stats': dict(self.daily_stats)
+                'equity_history': balance_stats['equity_history'][-100:],  # Last 100 points
+                'daily_stats': dict(self.daily_stats),
+                
+                # System stats
+                'api_stats': market_stats['rate_limiter_stats'],
+                'cache_stats': market_stats['cache_stats'],
+                'circuit_breaker': market_stats['circuit_breaker'],
+                
+                # Metadata
+                'is_running': self.is_running,
+                'leverage': Config.LEVERAGE,
+                'position_size': Config.POSITION_SIZE_USD
             }
 
-# ======================== ENHANCED DASHBOARD ========================
-ENHANCED_DASHBOARD_HTML = '''
+# ======================== PROFESSIONAL DASHBOARD ========================
+PROFESSIONAL_DASHBOARD_HTML = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>🚀 Advanced Crypto Trading Bot Dashboard</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Professional Crypto Trading Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-            color: #fff;
-            min-height: 100vh;
-            padding: 20px;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
         
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #0a0e27;
+            color: #e4e4e7;
+            line-height: 1.6;
+        }
+        
+        /* Header */
         .header {
-            background: rgba(255,255,255,0.05);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.1);
-            padding: 25px;
-            border-radius: 20px;
-            margin-bottom: 25px;
-            text-align: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 1.5rem;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.3);
+        }
+        
+        .header-content {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         
         .header h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            background: linear-gradient(45deg, #00ff88, #00a8ff);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 1.8rem;
+            font-weight: 700;
         }
         
-        .live-badge {
-            display: inline-block;
-            background: #ff4757;
-            color: white;
-            padding: 5px 15px;
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(255,255,255,0.2);
+            padding: 0.5rem 1rem;
             border-radius: 20px;
-            font-size: 0.9em;
+        }
+        
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            background: #10b981;
+            border-radius: 50%;
             animation: pulse 2s infinite;
         }
         
         @keyframes pulse {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
+            50% { opacity: 0.5; }
         }
         
-        .dashboard-grid {
+        /* Main Container */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        
+        /* Grid Layout */
+        .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 25px;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
         }
         
-        .card {
-            background: rgba(255,255,255,0.05);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.1);
-            padding: 20px;
-            border-radius: 15px;
-            transition: transform 0.3s;
+        .metric-card {
+            background: #1a1f3a;
+            border-radius: 12px;
+            padding: 1.5rem;
+            border: 1px solid #2a3f5f;
+            transition: transform 0.2s;
         }
         
-        .card:hover {
-            transform: translateY(-5px);
-        }
-        
-        .card-title {
-            font-size: 1.2em;
-            margin-bottom: 15px;
-            opacity: 0.9;
-        }
-        
-        .metric-large {
-            font-size: 2.5em;
-            font-weight: bold;
-            margin: 10px 0;
-        }
-        
-        .positive { color: #00ff88; }
-        .negative { color: #ff4757; }
-        .neutral { color: #ffa502; }
-        
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 15px;
-            margin-top: 15px;
-        }
-        
-        .metric-item {
-            text-align: center;
-            padding: 10px;
-            background: rgba(255,255,255,0.03);
-            border-radius: 10px;
-        }
-        
-        .metric-value {
-            font-size: 1.5em;
-            font-weight: bold;
-            margin-bottom: 5px;
+        .metric-card:hover {
+            transform: translateY(-2px);
+            border-color: #667eea;
         }
         
         .metric-label {
-            font-size: 0.85em;
-            opacity: 0.7;
+            font-size: 0.875rem;
+            color: #9ca3af;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
         
+        .metric-value {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        
+        .metric-change {
+            font-size: 0.875rem;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+        
+        .positive {
+            color: #10b981;
+        }
+        
+        .negative {
+            color: #ef4444;
+        }
+        
+        .neutral {
+            color: #6b7280;
+        }
+        
+        /* Chart Container */
         .chart-container {
+            background: #1a1f3a;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            border: 1px solid #2a3f5f;
+        }
+        
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        
+        .chart-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+        
+        .chart-canvas {
             position: relative;
             height: 300px;
-            margin: 20px 0;
         }
         
+        /* Tables */
         .table-container {
+            background: #1a1f3a;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            border: 1px solid #2a3f5f;
             overflow-x: auto;
-            margin-top: 20px;
+        }
+        
+        .table-header {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
         }
         
         table {
@@ -1063,190 +1091,323 @@ ENHANCED_DASHBOARD_HTML = '''
             border-collapse: collapse;
         }
         
-        th, td {
-            padding: 12px;
+        th {
+            background: #0f1729;
+            padding: 0.75rem;
             text-align: left;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: #9ca3af;
+            border-bottom: 2px solid #2a3f5f;
         }
         
-        th {
-            background: rgba(255,255,255,0.05);
-            font-weight: bold;
+        td {
+            padding: 0.75rem;
+            border-bottom: 1px solid #2a3f5f;
+            font-size: 0.875rem;
         }
         
         tr:hover {
-            background: rgba(255,255,255,0.02);
+            background: rgba(102, 126, 234, 0.1);
         }
         
-        .algo-row.active {
-            border-left: 3px solid #00ff88;
-        }
-        
-        .algo-row.inactive {
-            opacity: 0.6;
-        }
-        
+        /* Position Badge */
         .position-badge {
             display: inline-block;
-            padding: 3px 8px;
-            border-radius: 5px;
-            font-size: 0.85em;
-            font-weight: bold;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
         }
         
-        .badge-long { background: #00b894; }
-        .badge-short { background: #d63031; }
-        
-        .sl-tp {
-            font-size: 0.85em;
-            opacity: 0.8;
+        .badge-long {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
         }
         
+        .badge-short {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+        
+        /* API Stats */
+        .api-stats {
+            display: flex;
+            gap: 2rem;
+            padding: 1rem;
+            background: #0f1729;
+            border-radius: 8px;
+            margin-top: 1rem;
+        }
+        
+        .api-stat {
+            flex: 1;
+        }
+        
+        .api-stat-label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 0.25rem;
+        }
+        
+        .api-stat-value {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+        
+        /* Progress Bar */
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #2a3f5f;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s ease;
+        }
+        
+        /* Two Column Layout */
+        .two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+        
+        @media (max-width: 1024px) {
+            .two-column {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #1a1f3a;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+        
+        /* Footer */
         .footer {
             text-align: center;
-            margin-top: 40px;
-            padding: 20px;
-            opacity: 0.7;
+            padding: 2rem;
+            color: #6b7280;
+            border-top: 1px solid #2a3f5f;
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>Advanced Crypto Trading Bot</h1>
-        <span class="live-badge">● LIVE TRADING</span>
-        <p style="margin-top: 10px; opacity: 0.8;">
-            19 Algorithms | 10x Leverage | Auto Risk Management
-        </p>
+        <div class="header-content">
+            <div>
+                <h1>Professional Crypto Trading Dashboard</h1>
+                <p>Binance Global • 19 Algorithms • 10x Leverage</p>
+            </div>
+            <div class="status-badge">
+                <div class="status-indicator"></div>
+                <span>LIVE TRADING</span>
+            </div>
+        </div>
     </div>
     
-    <div class="dashboard-grid">
-        <!-- Balance Card -->
-        <div class="card">
-            <div class="card-title">💰 Account Balance</div>
-            <div id="balance" class="metric-large positive">$0.00</div>
-            <div class="metric-grid">
-                <div class="metric-item">
-                    <div id="initial-balance" class="metric-value">$0</div>
-                    <div class="metric-label">Initial</div>
+    <div class="container">
+        <!-- Main Metrics -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Live Balance</div>
+                <div id="balance" class="metric-value">$0.00</div>
+                <div id="balance-change" class="metric-change neutral">
+                    <span>0.00%</span> from initial
                 </div>
-                <div class="metric-item">
-                    <div id="roi" class="metric-value">0%</div>
-                    <div class="metric-label">ROI</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-label">Total P&L</div>
+                <div id="total-pnl" class="metric-value">$0.00</div>
+                <div class="metric-change">
+                    <span id="realized-pnl" class="neutral">R: $0.00</span>
+                    <span> | </span>
+                    <span id="unrealized-pnl" class="neutral">U: $0.00</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-label">ROI %</div>
+                <div id="roi" class="metric-value">0.00%</div>
+                <div class="metric-change">
+                    <span>Max DD: </span>
+                    <span id="max-drawdown" class="negative">0.00%</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-label">Win Rate</div>
+                <div id="win-rate" class="metric-value">0.00%</div>
+                <div class="metric-change">
+                    <span id="wins" class="positive">0W</span>
+                    <span> / </span>
+                    <span id="losses" class="negative">0L</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-label">Open Trades</div>
+                <div id="open-trades" class="metric-value">0</div>
+                <div class="metric-change">
+                    <span>Closed: </span>
+                    <span id="closed-trades">0</span>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-label">API Usage</div>
+                <div id="api-usage" class="metric-value">0/1200</div>
+                <div class="progress-bar">
+                    <div id="api-progress" class="progress-fill" style="width: 0%"></div>
                 </div>
             </div>
         </div>
         
-        <!-- P&L Card -->
-        <div class="card">
-            <div class="card-title">📊 Profit & Loss</div>
-            <div id="total-pnl" class="metric-large neutral">$0.00</div>
-            <div class="metric-grid">
-                <div class="metric-item">
-                    <div id="realized-pnl" class="metric-value">$0</div>
-                    <div class="metric-label">Realized</div>
+        <!-- Charts -->
+        <div class="two-column">
+            <div class="chart-container">
+                <div class="chart-header">
+                    <h3 class="chart-title">Equity Curve</h3>
+                    <span id="equity-last-update" class="neutral">Live</span>
                 </div>
-                <div class="metric-item">
-                    <div id="unrealized-pnl" class="metric-value">$0</div>
-                    <div class="metric-label">Unrealized</div>
+                <div class="chart-canvas">
+                    <canvas id="equityChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="chart-container">
+                <div class="chart-header">
+                    <h3 class="chart-title">Live P&L Chart</h3>
+                    <span id="pnl-last-update" class="neutral">Live</span>
+                </div>
+                <div class="chart-canvas">
+                    <canvas id="pnlChart"></canvas>
                 </div>
             </div>
         </div>
         
-        <!-- Performance Card -->
-        <div class="card">
-            <div class="card-title">🎯 Performance Stats</div>
-            <div class="metric-grid">
-                <div class="metric-item">
-                    <div id="win-rate" class="metric-value">0%</div>
-                    <div class="metric-label">Win Rate</div>
-                </div>
-                <div class="metric-item">
-                    <div id="total-trades" class="metric-value">0</div>
-                    <div class="metric-label">Total Trades</div>
-                </div>
-                <div class="metric-item">
-                    <div id="wins" class="metric-value positive">0</div>
-                    <div class="metric-label">Wins</div>
-                </div>
-                <div class="metric-item">
-                    <div id="losses" class="metric-value negative">0</div>
-                    <div class="metric-label">Losses</div>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Charts -->
-    <div class="dashboard-grid">
-        <div class="card" style="grid-column: 1 / -1;">
-            <div class="card-title">📈 Equity Curve</div>
-            <div class="chart-container">
-                <canvas id="equityChart"></canvas>
-            </div>
-        </div>
-    </div>
-    
-    <div class="dashboard-grid">
-        <div class="card" style="grid-column: 1 / -1;">
-            <div class="card-title">💹 Live P&L Chart</div>
-            <div class="chart-container">
-                <canvas id="pnlChart"></canvas>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Open Positions -->
-    <div class="card">
-        <div class="card-title">📋 Open Positions</div>
+        <!-- Open Positions -->
         <div class="table-container">
+            <h3 class="table-header">Open Positions</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Symbol</th>
                         <th>Side</th>
+                        <th>Qty</th>
                         <th>Entry</th>
                         <th>Current</th>
                         <th>P&L</th>
-                        <th>SL/TP</th>
+                        <th>P&L %</th>
+                        <th>SL</th>
+                        <th>TP</th>
                         <th>Algorithm</th>
+                        <th>Leverage</th>
                     </tr>
                 </thead>
                 <tbody id="positions-tbody">
-                    <tr><td colspan="7" style="text-align: center; opacity: 0.6;">No open positions</td></tr>
+                    <tr><td colspan="11" style="text-align: center; padding: 2rem;">No open positions</td></tr>
                 </tbody>
             </table>
         </div>
-    </div>
-    
-    <!-- Algorithm Performance -->
-    <div class="card">
-        <div class="card-title">🤖 Algorithm Performance</div>
+        
+        <!-- Algorithm Performance -->
         <div class="table-container">
+            <h3 class="table-header">Algorithm Performance</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Algorithm</th>
                         <th>Status</th>
                         <th>Trades</th>
-                        <th>P&L</th>
+                        <th>Wins</th>
+                        <th>Losses</th>
                         <th>Win Rate</th>
+                        <th>Total P&L</th>
+                        <th>Last Trade</th>
                     </tr>
                 </thead>
                 <tbody id="algorithms-tbody">
-                    <tr><td colspan="5" style="text-align: center; opacity: 0.6;">Loading...</td></tr>
+                    <tr><td colspan="8" style="text-align: center; padding: 2rem;">Loading...</td></tr>
                 </tbody>
             </table>
+        </div>
+        
+        <!-- Trade History -->
+        <div class="table-container">
+            <h3 class="table-header">Trade History (Last 20)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>P&L</th>
+                        <th>Algorithm</th>
+                    </tr>
+                </thead>
+                <tbody id="history-tbody">
+                    <tr><td colspan="7" style="text-align: center; padding: 2rem;">No trade history</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- System Stats -->
+        <div class="chart-container">
+            <h3 class="chart-title">System Statistics</h3>
+            <div class="api-stats">
+                <div class="api-stat">
+                    <div class="api-stat-label">API Requests/Min</div>
+                    <div id="api-requests" class="api-stat-value">0</div>
+                </div>
+                <div class="api-stat">
+                    <div class="api-stat-label">Success Rate</div>
+                    <div id="api-success" class="api-stat-value">100%</div>
+                </div>
+                <div class="api-stat">
+                    <div class="api-stat-label">Cache Hit Rate</div>
+                    <div id="cache-hit" class="api-stat-value">0%</div>
+                </div>
+                <div class="api-stat">
+                    <div class="api-stat-label">Circuit Breaker</div>
+                    <div id="circuit-breaker" class="api-stat-value positive">CLOSED</div>
+                </div>
+                <div class="api-stat">
+                    <div class="api-stat-label">Reset In</div>
+                    <div id="api-reset" class="api-stat-value">60s</div>
+                </div>
+            </div>
         </div>
     </div>
     
     <div class="footer">
         <p>Last Update: <span id="last-update">Never</span></p>
-        <p style="margin-top: 10px;">© 2024 Advanced Crypto Trading Bot</p>
+        <p>© 2024 Professional Crypto Trading Bot • Binance Global</p>
     </div>
     
     <script>
         // Chart configurations
-        const chartOptions = {
+        const chartConfig = {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
@@ -1255,170 +1416,251 @@ ENHANCED_DASHBOARD_HTML = '''
             scales: {
                 x: {
                     grid: { color: 'rgba(255,255,255,0.05)' },
-                    ticks: { color: 'rgba(255,255,255,0.7)' }
+                    ticks: { color: '#6b7280' }
                 },
                 y: {
                     grid: { color: 'rgba(255,255,255,0.05)' },
-                    ticks: { color: 'rgba(255,255,255,0.7)' }
+                    ticks: { color: '#6b7280' }
                 }
             }
         };
         
-        // Initialize charts
+        // Initialize Equity Chart
         const equityCtx = document.getElementById('equityChart').getContext('2d');
         const equityChart = new Chart(equityCtx, {
             type: 'line',
             data: {
                 labels: [],
                 datasets: [{
-                    label: 'Equity',
                     data: [],
-                    borderColor: '#00ff88',
-                    backgroundColor: 'rgba(0,255,136,0.1)',
-                    tension: 0.4
+                    borderColor: '#667eea',
+                    backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                    borderWidth: 2,
+                    tension: 0.4,
+                    fill: true
                 }]
             },
-            options: chartOptions
+            options: chartConfig
         });
         
+        // Initialize P&L Chart
         const pnlCtx = document.getElementById('pnlChart').getContext('2d');
         const pnlChart = new Chart(pnlCtx, {
             type: 'bar',
             data: {
                 labels: [],
                 datasets: [{
-                    label: 'P&L',
                     data: [],
                     backgroundColor: []
                 }]
             },
-            options: chartOptions
+            options: chartConfig
         });
         
+        // Format functions
         function formatCurrency(value) {
-            return new Intl.NumberFormat('en-US', {
+            const formatted = new Intl.NumberFormat('en-US', {
                 style: 'currency',
                 currency: 'USD',
-                minimumFractionDigits: 2
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
             }).format(value);
+            return formatted;
         }
         
-        function updateDashboard() {
-            // Fetch status
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    // Update balance
-                    document.getElementById('balance').textContent = formatCurrency(data.balance || 0);
-                    document.getElementById('balance').className = 'metric-large ' + 
-                        (data.balance > data.initial_balance ? 'positive' : 
-                         data.balance < data.initial_balance ? 'negative' : 'neutral');
-                    
-                    document.getElementById('initial-balance').textContent = formatCurrency(data.initial_balance || 0);
-                    document.getElementById('roi').textContent = (data.roi || 0) + '%';
-                    document.getElementById('roi').className = 'metric-value ' + 
-                        (data.roi > 0 ? 'positive' : data.roi < 0 ? 'negative' : 'neutral');
-                    
-                    // Update P&L
-                    document.getElementById('total-pnl').textContent = formatCurrency(data.total_pnl || 0);
-                    document.getElementById('total-pnl').className = 'metric-large ' + 
-                        (data.total_pnl > 0 ? 'positive' : data.total_pnl < 0 ? 'negative' : 'neutral');
-                    
-                    document.getElementById('realized-pnl').textContent = formatCurrency(data.realized_pnl || 0);
-                    document.getElementById('unrealized-pnl').textContent = formatCurrency(data.unrealized_pnl || 0);
-                    
-                    // Update performance
-                    document.getElementById('win-rate').textContent = (data.win_rate || 0) + '%';
-                    document.getElementById('total-trades').textContent = data.total_trades || 0;
-                    document.getElementById('wins').textContent = data.total_wins || 0;
-                    document.getElementById('losses').textContent = data.total_losses || 0;
-                    
-                    // Update timestamp
-                    document.getElementById('last-update').textContent = new Date().toLocaleString();
-                });
-            
-            // Fetch positions
-            fetch('/api/positions')
-                .then(r => r.json())
-                .then(data => {
-                    const tbody = document.getElementById('positions-tbody');
-                    if (data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; opacity: 0.6;">No open positions</td></tr>';
-                    } else {
-                        tbody.innerHTML = data.map(pos => `
-                            <tr>
-                                <td><strong>${pos.symbol}</strong></td>
-                                <td><span class="position-badge badge-${pos.side.toLowerCase()}">${pos.side}</span></td>
-                                <td>${formatCurrency(pos.entry_price)}</td>
-                                <td>${formatCurrency(pos.current_price)}</td>
-                                <td class="${pos.current_pnl >= 0 ? 'positive' : 'negative'}">
-                                    ${formatCurrency(pos.current_pnl)}
-                                </td>
-                                <td class="sl-tp">
-                                    SL: ${formatCurrency(pos.stop_loss)}<br>
-                                    TP: ${formatCurrency(pos.take_profit)}
-                                </td>
-                                <td>${pos.algorithm}</td>
-                            </tr>
-                        `).join('');
-                    }
-                });
-            
-            // Fetch algorithms
-            fetch('/api/algorithms')
-                .then(r => r.json())
-                .then(data => {
-                    const tbody = document.getElementById('algorithms-tbody');
-                    tbody.innerHTML = data.map(algo => `
-                        <tr class="algo-row ${algo.is_active ? 'active' : 'inactive'}">
-                            <td>${algo.name}</td>
-                            <td>${algo.is_active ? '🟢 Active' : '⚫ Complete'}</td>
+        function formatPercent(value) {
+            return value.toFixed(2) + '%';
+        }
+        
+        function formatTime(isoString) {
+            if (!isoString) return '-';
+            return new Date(isoString).toLocaleString();
+        }
+        
+        function updateMetricColor(element, value) {
+            element.classList.remove('positive', 'negative', 'neutral');
+            if (value > 0) {
+                element.classList.add('positive');
+            } else if (value < 0) {
+                element.classList.add('negative');
+            } else {
+                element.classList.add('neutral');
+            }
+        }
+        
+        // Update dashboard
+        async function updateDashboard() {
+            try {
+                const response = await fetch('/api/comprehensive-status');
+                const data = await response.json();
+                
+                // Update balance
+                const balanceEl = document.getElementById('balance');
+                balanceEl.textContent = formatCurrency(data.balance || 0);
+                updateMetricColor(balanceEl, data.balance - data.initial_balance);
+                
+                const balanceChange = ((data.balance - data.initial_balance) / data.initial_balance * 100);
+                document.getElementById('balance-change').innerHTML = 
+                    `<span class="${balanceChange >= 0 ? 'positive' : 'negative'}">${balanceChange >= 0 ? '+' : ''}${formatPercent(balanceChange)}</span> from initial`;
+                
+                // Update P&L
+                const totalPnlEl = document.getElementById('total-pnl');
+                totalPnlEl.textContent = formatCurrency(data.total_pnl || 0);
+                updateMetricColor(totalPnlEl, data.total_pnl);
+                
+                const realizedEl = document.getElementById('realized-pnl');
+                realizedEl.textContent = 'R: ' + formatCurrency(data.realized_pnl || 0);
+                updateMetricColor(realizedEl, data.realized_pnl);
+                
+                const unrealizedEl = document.getElementById('unrealized-pnl');
+                unrealizedEl.textContent = 'U: ' + formatCurrency(data.unrealized_pnl || 0);
+                updateMetricColor(unrealizedEl, data.unrealized_pnl);
+                
+                // Update ROI and Drawdown
+                const roiEl = document.getElementById('roi');
+                roiEl.textContent = formatPercent(data.roi || 0);
+                updateMetricColor(roiEl, data.roi);
+                
+                document.getElementById('max-drawdown').textContent = formatPercent(data.max_drawdown || 0);
+                
+                // Update Win Rate
+                document.getElementById('win-rate').textContent = formatPercent(data.win_rate || 0);
+                document.getElementById('wins').textContent = (data.total_wins || 0) + 'W';
+                document.getElementById('losses').textContent = (data.total_losses || 0) + 'L';
+                
+                // Update Trade Counts
+                document.getElementById('open-trades').textContent = data.open_positions_count || 0;
+                document.getElementById('closed-trades').textContent = data.closed_trades_count || 0;
+                
+                // Update API Usage
+                const apiUsage = data.api_stats || {};
+                document.getElementById('api-usage').textContent = 
+                    `${apiUsage.requests_used || 0}/${apiUsage.requests_limit || 1200}`;
+                const apiPercent = ((apiUsage.requests_used || 0) / (apiUsage.requests_limit || 1200)) * 100;
+                document.getElementById('api-progress').style.width = apiPercent + '%';
+                
+                // Update System Stats
+                document.getElementById('api-requests').textContent = apiUsage.requests_used || 0;
+                document.getElementById('api-success').textContent = formatPercent(apiUsage.success_rate || 100);
+                document.getElementById('cache-hit').textContent = formatPercent(data.cache_stats?.hit_rate || 0);
+                document.getElementById('circuit-breaker').textContent = data.circuit_breaker ? 'OPEN' : 'CLOSED';
+                document.getElementById('circuit-breaker').className = 'api-stat-value ' + (data.circuit_breaker ? 'negative' : 'positive');
+                document.getElementById('api-reset').textContent = Math.round(apiUsage.reset_in || 60) + 's';
+                
+                // Update Open Positions Table
+                const positionsTbody = document.getElementById('positions-tbody');
+                if (data.open_positions && data.open_positions.length > 0) {
+                    positionsTbody.innerHTML = data.open_positions.map(pos => `
+                        <tr>
+                            <td><strong>${pos.symbol}</strong></td>
+                            <td><span class="position-badge badge-${pos.side.toLowerCase()}">${pos.side}</span></td>
+                            <td>${pos.quantity.toFixed(6)}</td>
+                            <td>${formatCurrency(pos.entry_price)}</td>
+                            <td>${formatCurrency(pos.current_price)}</td>
+                            <td class="${pos.unrealized_pnl >= 0 ? 'positive' : 'negative'}">
+                                ${formatCurrency(pos.unrealized_pnl)}
+                            </td>
+                            <td class="${pos.pnl_percent >= 0 ? 'positive' : 'negative'}">
+                                ${formatPercent(pos.pnl_percent)}
+                            </td>
+                            <td>${formatCurrency(pos.stop_loss)}</td>
+                            <td>${formatCurrency(pos.take_profit)}</td>
+                            <td>${pos.algorithm}</td>
+                            <td>${pos.leverage}x</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    positionsTbody.innerHTML = '<tr><td colspan="11" style="text-align: center; padding: 2rem;">No open positions</td></tr>';
+                }
+                
+                // Update Algorithm Performance Table
+                const algorithmsTbody = document.getElementById('algorithms-tbody');
+                if (data.algorithms && data.algorithms.length > 0) {
+                    algorithmsTbody.innerHTML = data.algorithms.map(algo => `
+                        <tr>
+                            <td><strong>${algo.name}</strong></td>
+                            <td>${algo.is_active ? '<span class="positive">Active</span>' : '<span class="neutral">Complete</span>'}</td>
                             <td>${algo.trade_count}/${algo.max_trades}</td>
+                            <td class="positive">${algo.win_count}</td>
+                            <td class="negative">${algo.loss_count}</td>
+                            <td>${formatPercent(algo.win_rate)}</td>
                             <td class="${algo.total_pnl >= 0 ? 'positive' : 'negative'}">
                                 ${formatCurrency(algo.total_pnl)}
                             </td>
-                            <td>${algo.win_rate.toFixed(1)}%</td>
+                            <td>${algo.last_trade_time ? formatTime(algo.last_trade_time) : '-'}</td>
                         </tr>
                     `).join('');
-                });
-            
-            // Fetch equity history
-            fetch('/api/equity-history')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.length > 0) {
-                        const labels = data.slice(-50).map(d => 
-                            new Date(d.timestamp).toLocaleTimeString()
-                        );
-                        const values = data.slice(-50).map(d => d.balance);
-                        
-                        equityChart.data.labels = labels;
-                        equityChart.data.datasets[0].data = values;
-                        equityChart.update();
+                }
+                
+                // Update Trade History Table
+                const historyTbody = document.getElementById('history-tbody');
+                if (data.trade_history && data.trade_history.length > 0) {
+                    historyTbody.innerHTML = data.trade_history.slice(0, 20).map(trade => `
+                        <tr>
+                            <td>${formatTime(trade.exit_time)}</td>
+                            <td><strong>${trade.symbol}</strong></td>
+                            <td>${trade.side.toUpperCase()}</td>
+                            <td>${formatCurrency(trade.entry_price)}</td>
+                            <td>${formatCurrency(trade.exit_price)}</td>
+                            <td class="${trade.pnl >= 0 ? 'positive' : 'negative'}">
+                                ${formatCurrency(trade.pnl)}
+                            </td>
+                            <td>${trade.algorithm}</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    historyTbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 2rem;">No trade history</td></tr>';
+                }
+                
+                // Update Equity Chart
+                if (data.equity_history && data.equity_history.length > 0) {
+                    const labels = data.equity_history.map(h => 
+                        new Date(h.timestamp).toLocaleTimeString()
+                    );
+                    const values = data.equity_history.map(h => h.balance);
+                    
+                    equityChart.data.labels = labels;
+                    equityChart.data.datasets[0].data = values;
+                    equityChart.update();
+                    
+                    document.getElementById('equity-last-update').textContent = 
+                        new Date().toLocaleTimeString();
+                }
+                
+                // Update P&L Chart
+                if (data.equity_history && data.equity_history.length > 1) {
+                    const pnlData = [];
+                    const pnlColors = [];
+                    const pnlLabels = [];
+                    
+                    for (let i = 1; i < Math.min(data.equity_history.length, 20); i++) {
+                        const pnl = data.equity_history[i].pnl || 0;
+                        pnlData.push(pnl);
+                        pnlColors.push(pnl >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(239, 68, 68, 0.8)');
+                        pnlLabels.push(new Date(data.equity_history[i].timestamp).toLocaleTimeString());
                     }
-                });
-            
-            // Fetch P&L history
-            fetch('/api/pnl-history')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.length > 0) {
-                        const labels = data.slice(-20).map(d => 
-                            new Date(d.timestamp).toLocaleTimeString()
-                        );
-                        const values = data.slice(-20).map(d => d.pnl);
-                        const colors = values.map(v => v >= 0 ? '#00ff88' : '#ff4757');
-                        
-                        pnlChart.data.labels = labels;
-                        pnlChart.data.datasets[0].data = values;
-                        pnlChart.data.datasets[0].backgroundColor = colors;
-                        pnlChart.update();
-                    }
-                });
+                    
+                    pnlChart.data.labels = pnlLabels;
+                    pnlChart.data.datasets[0].data = pnlData;
+                    pnlChart.data.datasets[0].backgroundColor = pnlColors;
+                    pnlChart.update();
+                    
+                    document.getElementById('pnl-last-update').textContent = 
+                        new Date().toLocaleTimeString();
+                }
+                
+                // Update last update time
+                document.getElementById('last-update').textContent = new Date().toLocaleString();
+                
+            } catch (error) {
+                console.error('Error updating dashboard:', error);
+            }
         }
         
         // Update every 2 seconds
         setInterval(updateDashboard, 2000);
+        
+        // Initial update
         updateDashboard();
     </script>
 </body>
@@ -1432,71 +1674,27 @@ def create_app(engine: TradingEngine):
     
     @app.route('/')
     def index():
-        return render_template_string(ENHANCED_DASHBOARD_HTML)
+        return render_template_string(PROFESSIONAL_DASHBOARD_HTML)
     
-    @app.route('/api/status')
-    def status():
-        return jsonify(engine.get_status())
-    
-    @app.route('/api/positions')
-    def positions():
-        positions_data = []
-        for pos_key, position in engine.positions.items():
-            latest_price = position.current_price
-            for data in reversed(list(engine.market_data_queue)):
-                if data.symbol == position.symbol:
-                    latest_price = data.price
-                    break
-            
-            algo = next((a for a in engine.algorithms 
-                        if a.algorithm_id == position.algorithm_id), None)
-            
-            positions_data.append({
-                'symbol': position.symbol,
-                'side': 'LONG' if position.quantity > 0 else 'SHORT',
-                'entry_price': position.entry_price,
-                'current_price': latest_price,
-                'current_pnl': position.unrealized_pnl,
-                'stop_loss': position.stop_loss,
-                'take_profit': position.take_profit,
-                'algorithm': algo.name if algo else 'Unknown'
-            })
-        
-        return jsonify(positions_data)
-    
-    @app.route('/api/algorithms')
-    def algorithms():
-        return jsonify([algo.state.to_dict() for algo in engine.algorithms])
-    
-    @app.route('/api/equity-history')
-    def equity_history():
-        return jsonify(engine.balance_manager.get_equity_history())
-    
-    @app.route('/api/pnl-history')
-    def pnl_history():
-        history = engine.balance_manager.get_equity_history()
-        pnl_data = []
-        for i in range(1, len(history)):
-            pnl_data.append({
-                'timestamp': history[i]['timestamp'],
-                'pnl': history[i].get('pnl', 0)
-            })
-        return jsonify(pnl_data)
+    @app.route('/api/comprehensive-status')
+    def comprehensive_status():
+        """Get comprehensive status for dashboard"""
+        return jsonify(engine.get_comprehensive_status())
     
     return app
 
 # ======================== MAIN APPLICATION ========================
 def data_feed_loop(engine: TradingEngine):
-    """Main data feed loop"""
-    logger.info("🔴 Starting live data feed")
+    """Main data feed loop using Binance Global"""
+    logger.info("🔴 Starting Binance Global live data feed")
     
     while engine.is_running:
         try:
-            # Get market data
-            market_data_list = engine.market_data_manager.get_market_data()
+            # Get market data from Binance
+            market_data_list = engine.market_data_provider.batch_get_market_data()
             
             if not market_data_list:
-                logger.warning("No market data received")
+                logger.warning("No market data received from Binance")
                 time.sleep(10)
                 continue
             
@@ -1507,45 +1705,21 @@ def data_feed_loop(engine: TradingEngine):
                 
                 engine.process_market_data(market_data)
                 
-                # Small delay between symbols
-                time.sleep(0.1)
+                # Small delay between processing
+                time.sleep(0.05)
             
             # Wait before next update
             time.sleep(Config.DATA_UPDATE_INTERVAL)
             
         except Exception as e:
             logger.error(f"Error in data feed: {e}")
-            json_logger.log('error', {'type': 'data_feed', 'error': str(e)})
             time.sleep(10)
-
-def send_daily_report(engine: TradingEngine):
-    """Send daily performance report"""
-    while engine.is_running:
-        try:
-            # Wait until next day at 00:00 UTC
-            now = datetime.now()
-            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-            sleep_seconds = (tomorrow - now).total_seconds()
-            time.sleep(min(sleep_seconds, 3600))  # Check at least every hour
-            
-            if not engine.is_running:
-                break
-            
-            # Send report
-            status = engine.get_status()
-            telegram_bot.send_daily_report(status)
-            
-            # Log daily stats
-            json_logger.log('daily_report', status)
-            
-        except Exception as e:
-            logger.error(f"Error sending daily report: {e}")
-            time.sleep(3600)
 
 def main():
     """Main entry point"""
     logger.info("=" * 70)
-    logger.info("🚀 ADVANCED CRYPTO FUTURES TRADING BOT v3.0")
+    logger.info("🚀 PROFESSIONAL CRYPTO FUTURES TRADING BOT v4.0")
+    logger.info("📊 Using Binance Global (NOT Binance.US)")
     logger.info("=" * 70)
     
     # Initialize trading engine
@@ -1557,21 +1731,17 @@ def main():
     data_thread.daemon = True
     data_thread.start()
     
-    # Start daily report thread
-    report_thread = Thread(target=send_daily_report, args=(engine,))
-    report_thread.daemon = True
-    report_thread.start()
-    
     # Create Flask app
     app = create_app(engine)
     
     logger.info("=" * 70)
-    logger.info("📊 Dashboard: http://0.0.0.0:" + str(Config.PORT))
+    logger.info(f"📊 Professional Dashboard: http://0.0.0.0:{Config.PORT}")
     logger.info("🔴 LIVE TRADING ACTIVE")
-    logger.info("• 19 Algorithms (2 trades each max)")
+    logger.info(f"• 19 Algorithms ({Config.MAX_TRADES_PER_ALGO} trades each max)")
     logger.info(f"• {Config.LEVERAGE}x Leverage")
     logger.info(f"• ${Config.POSITION_SIZE_USD} per position")
     logger.info(f"• Balance: ${engine.balance_manager.get_balance():.2f}")
+    logger.info("• Binance Global API with smart caching")
     logger.info("=" * 70)
     
     try:
