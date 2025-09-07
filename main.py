@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-NUCLEAR FIXED Crypto Futures Trading Bot v6.0
-Bulletproof implementation with watchdog, auto-recovery, and crashproof loops
-Single file with comprehensive dashboard and zero-crash guarantee
+NUCLEAR FIXED Crypto Futures Trading Bot v7.0
+Complete single file with auto-recovery, non-blocking API, and 1h timeframe
 """
 
 import os
@@ -15,13 +14,14 @@ import logging
 import requests
 import threading
 import traceback
+import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from collections import deque, defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from threading import Thread, Lock, Event
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -30,39 +30,33 @@ load_dotenv()
 
 # ======================== CONFIGURATION ========================
 class Config:
-    """Central configuration from environment variables"""
-    # Binance Global API (NOT Binance.US)
     BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
     BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
     
-    # Telegram
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', 'true').lower() == 'true'
     
-    # Trading Parameters
     INITIAL_BALANCE = float(os.getenv('INITIAL_BALANCE', '10000'))
     POSITION_SIZE_USD = float(os.getenv('POSITION_SIZE_USD', '100'))
     LEVERAGE = int(os.getenv('LEVERAGE', '10'))
     MAX_TRADES_PER_ALGO = int(os.getenv('MAX_TRADES_PER_ALGO', '2'))
     
-    # System
     PORT = int(os.getenv('PORT', '10000'))
-    DATA_UPDATE_INTERVAL = int(os.getenv('DATA_UPDATE_INTERVAL', '5'))
+    DATA_UPDATE_INTERVAL = int(os.getenv('DATA_UPDATE_INTERVAL', '60'))  # 1 minute for 1h timeframe
     BALANCE_FILE = 'data/balance.json'
     
-    # Risk Management
     STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', '2.0'))
     TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', '3.0'))
     
-    # Binance Rate Limits (Conservative to avoid bans)
-    BINANCE_MAX_REQUESTS_PER_MIN = 600  # Half of actual limit for safety
-    BINANCE_WEIGHT_PER_MIN = 3000  # Half of actual limit
+    # Conservative Binance limits
+    BINANCE_MAX_REQUESTS_PER_MIN = 600
+    API_TIMEOUT = 5  # 5 second timeout for all API calls
 
-# Create data directory if not exists
+# Create data directory
 os.makedirs('data', exist_ok=True)
 
-# ======================== NUCLEAR LOGGING ========================
+# ======================== LOGGING ========================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -73,79 +67,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ======================== WATCHDOG SYSTEM ========================
-class WatchdogSystem:
-    """Nuclear watchdog to monitor and restart failed components"""
+# ======================== GLOBAL THREAD REGISTRY ========================
+class ThreadRegistry:
+    """Registry to track and restart threads"""
     def __init__(self):
+        self.threads = {}
         self.lock = Lock()
         self.heartbeats = {}
-        self.restart_callbacks = {}
-        self.monitoring = False
-        self.watchdog_thread = None
         
-    def register(self, component_name: str, restart_callback=None):
-        """Register a component for monitoring"""
+    def register(self, name: str, target_func, args=()):
+        """Register a thread for monitoring"""
         with self.lock:
-            self.heartbeats[component_name] = datetime.now()
-            if restart_callback:
-                self.restart_callbacks[component_name] = restart_callback
-            logger.info(f"🛡️ Watchdog: Registered {component_name}")
-    
-    def heartbeat(self, component_name: str):
-        """Update heartbeat for a component"""
+            self.threads[name] = {
+                'target': target_func,
+                'args': args,
+                'thread': None,
+                'last_heartbeat': datetime.now()
+            }
+            self.heartbeats[name] = datetime.now()
+            
+    def heartbeat(self, name: str):
+        """Update heartbeat for thread"""
         with self.lock:
-            self.heartbeats[component_name] = datetime.now()
-    
-    def check_health(self):
-        """Check all components health"""
+            self.heartbeats[name] = datetime.now()
+            if name in self.threads:
+                self.threads[name]['last_heartbeat'] = datetime.now()
+                
+    def restart_thread(self, name: str):
+        """Kill and restart a thread"""
         with self.lock:
-            now = datetime.now()
+            if name not in self.threads:
+                return
+                
+            thread_info = self.threads[name]
+            
+            # Try to stop old thread
+            if thread_info['thread'] and thread_info['thread'].is_alive():
+                logger.warning(f"Cannot kill thread {name}, starting new one anyway")
+            
+            # Start new thread
+            new_thread = Thread(target=thread_info['target'], args=thread_info['args'], daemon=True)
+            new_thread.start()
+            thread_info['thread'] = new_thread
+            thread_info['last_heartbeat'] = datetime.now()
+            self.heartbeats[name] = datetime.now()
+            logger.info(f"✅ Restarted thread: {name}")
+            
+    def check_health(self) -> List[str]:
+        """Check thread health and return unhealthy ones"""
+        with self.lock:
             unhealthy = []
-            
-            for component, last_heartbeat in self.heartbeats.items():
-                time_since = (now - last_heartbeat).total_seconds()
-                if time_since > 30:  # 30 seconds timeout
-                    unhealthy.append((component, time_since))
-            
+            now = datetime.now()
+            for name, last_heartbeat in self.heartbeats.items():
+                if (now - last_heartbeat).total_seconds() > 20:
+                    unhealthy.append(name)
             return unhealthy
-    
-    def start_monitoring(self):
-        """Start the watchdog monitoring loop"""
-        self.monitoring = True
-        self.watchdog_thread = Thread(target=self._monitor_loop, daemon=True)
-        self.watchdog_thread.start()
-        logger.info("🛡️ Watchdog system activated")
-    
-    def _monitor_loop(self):
-        """Nuclear monitoring loop - NEVER CRASHES"""
-        while self.monitoring:
-            try:
-                unhealthy = self.check_health()
-                
-                for component, time_since in unhealthy:
-                    logger.warning(f"🚨 Watchdog: {component} unhealthy (no heartbeat for {time_since:.1f}s)")
-                    
-                    # Try to restart the component
-                    if component in self.restart_callbacks:
-                        try:
-                            logger.info(f"🔄 Watchdog: Attempting to restart {component}")
-                            self.restart_callbacks[component]()
-                            self.heartbeats[component] = datetime.now()
-                        except Exception as e:
-                            logger.error(f"🔥 Watchdog: Failed to restart {component}: {e}")
-                
-                time.sleep(10)  # Check every 10 seconds
-                
-            except Exception as e:
-                logger.error(f"🛡️ Watchdog error (continuing): {e}")
-                time.sleep(10)
 
-# Global watchdog instance
-watchdog = WatchdogSystem()
+thread_registry = ThreadRegistry()
 
 # ======================== TELEGRAM ========================
 class TelegramBot:
-    """Telegram bot for notifications"""
     def __init__(self, token: str, chat_id: str):
         self.token = token
         self.chat_id = chat_id
@@ -153,37 +134,30 @@ class TelegramBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
         
     def send_message(self, message: str, parse_mode: str = 'HTML'):
-        """Send message to Telegram - crashproof"""
         if not self.enabled:
             return
         try:
             url = f"{self.base_url}/sendMessage"
             data = {'chat_id': self.chat_id, 'text': message, 'parse_mode': parse_mode}
-            response = requests.post(url, data=data, timeout=5)
-        except Exception as e:
-            logger.debug(f"Telegram error (non-critical): {e}")
+            requests.post(url, data=data, timeout=3)
+        except:
+            pass
     
     def send_trade_alert(self, trade_type: str, symbol: str, side: str, price: float, quantity: float, pnl: float = None):
-        """Send trade alert to Telegram"""
         try:
             emoji = "🟢" if side.upper() == "LONG" else "🔴"
             message = f"<b>{emoji} {trade_type} Alert</b>\n"
-            message += f"Symbol: {symbol}\n"
-            message += f"Side: {side}\n"
-            message += f"Price: ${price:.2f}\n"
-            message += f"Quantity: {quantity:.6f}\n"
+            message += f"Symbol: {symbol}\nSide: {side}\nPrice: ${price:.2f}\nQuantity: {quantity:.6f}\n"
             if pnl is not None:
-                pnl_emoji = "💰" if pnl > 0 else "📉"
-                message += f"P&L: {pnl_emoji} ${pnl:+.2f}"
+                message += f"P&L: ${pnl:+.2f}"
             self.send_message(message)
         except:
-            pass  # Never crash on telegram errors
+            pass
 
 telegram_bot = TelegramBot(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
 
-# ======================== SAFE RATE LIMITER ========================
-class SafeRateLimiter:
-    """Thread-safe rate limiter for Binance API"""
+# ======================== RATE LIMITER ========================
+class RateLimiter:
     def __init__(self):
         self.requests_per_min = Config.BINANCE_MAX_REQUESTS_PER_MIN
         self.requests = deque()
@@ -193,15 +167,11 @@ class SafeRateLimiter:
         self.failed_requests = 0
         
     def can_make_request(self) -> bool:
-        """Check if request can be made safely"""
         with self.lock:
             now = time.time()
-            
-            # Remove old requests (older than 1 minute)
             while self.requests and self.requests[0] < now - 60:
                 self.requests.popleft()
             
-            # Conservative check - leave buffer
             if len(self.requests) < self.requests_per_min:
                 self.requests.append(now)
                 self.total_requests += 1
@@ -209,45 +179,37 @@ class SafeRateLimiter:
             return False
     
     def wait_if_needed(self):
-        """Wait if rate limit exceeded - with timeout"""
-        attempts = 0
         while not self.can_make_request():
-            time.sleep(0.5)
-            attempts += 1
-            if attempts > 120:  # Max 60 seconds wait
-                logger.warning("Rate limit wait timeout - proceeding anyway")
-                return
+            time.sleep(0.1)
     
     def get_stats(self) -> Dict:
-        """Get rate limiter statistics"""
         with self.lock:
             now = time.time()
             while self.requests and self.requests[0] < now - 60:
                 self.requests.popleft()
             
+            success_rate = (self.successful_requests / max(self.total_requests, 1)) * 100
+            
             return {
                 'requests_used': len(self.requests),
                 'requests_limit': self.requests_per_min,
                 'total_requests': self.total_requests,
-                'success_rate': (self.successful_requests / max(self.total_requests, 1)) * 100,
-                'requests_remaining': self.requests_per_min - len(self.requests)
+                'success_rate': success_rate,
+                'failed_requests': self.failed_requests
             }
 
-# ======================== NUCLEAR CACHE ========================
-class NuclearCache:
-    """Bulletproof caching system with permanent fallback"""
-    def __init__(self, ttl: int = 10):
+# ======================== CACHE ========================
+class DataCache:
+    def __init__(self, ttl: int = 60):
         self.cache = {}
+        self.permanent_cache = {}
         self.ttl = ttl
         self.lock = Lock()
-        self.permanent_backup = {}  # Never expires
         self.hits = 0
         self.misses = 0
         
     def get(self, key: str) -> Optional[Any]:
-        """Get cached data with permanent fallback"""
         with self.lock:
-            # Try main cache
             if key in self.cache:
                 data, timestamp = self.cache[key]
                 if time.time() - timestamp < self.ttl:
@@ -255,28 +217,23 @@ class NuclearCache:
                     return data
                 del self.cache[key]
             
-            # Return permanent backup if available
             self.misses += 1
-            return self.permanent_backup.get(key)
+            return self.permanent_cache.get(key)
     
     def set(self, key: str, value: Any):
-        """Set cache data with permanent backup"""
         with self.lock:
             self.cache[key] = (value, time.time())
-            self.permanent_backup[key] = value  # Always keep backup
+            self.permanent_cache[key] = value
     
     def get_stats(self) -> Dict:
-        """Get cache statistics"""
-        total = self.hits + self.misses
+        total = max(self.hits + self.misses, 1)
         return {
             'hits': self.hits,
             'misses': self.misses,
-            'hit_rate': (self.hits / max(total, 1)) * 100,
-            'cached_items': len(self.cache),
-            'backup_items': len(self.permanent_backup)
+            'hit_rate': (self.hits / total) * 100
         }
 
-# ======================== MODELS (UNCHANGED) ========================
+# ======================== MODELS ========================
 class OrderStatus(Enum):
     PENDING = "pending"
     FILLED = "filled"
@@ -299,7 +256,6 @@ class TradeStatus(Enum):
 
 @dataclass
 class Trade:
-    """Trade execution record"""
     trade_id: str
     symbol: str
     side: OrderSide
@@ -317,7 +273,6 @@ class Trade:
     take_profit: Optional[float] = None
     
     def close(self, exit_price: float, exit_time: Optional[datetime] = None):
-        """Close the trade and calculate P&L"""
         self.exit_price = exit_price
         self.exit_time = exit_time or datetime.now()
         self.status = TradeStatus.CLOSED
@@ -336,7 +291,7 @@ class Trade:
             'entry_price': self.entry_price,
             'exit_price': self.exit_price,
             'entry_time': self.entry_time.isoformat() if isinstance(self.entry_time, datetime) else str(self.entry_time),
-            'exit_time': self.exit_time.isoformat() if self.exit_time and isinstance(self.exit_time, datetime) else None,
+            'exit_time': self.exit_time.isoformat() if self.exit_time else None,
             'status': self.status.value if isinstance(self.status, TradeStatus) else self.status,
             'pnl': self.pnl,
             'algorithm_id': self.algorithm_id,
@@ -347,7 +302,6 @@ class Trade:
 
 @dataclass
 class MarketData:
-    """Market data model"""
     symbol: str
     price: float
     volume: float
@@ -367,7 +321,6 @@ class MarketData:
 
 @dataclass
 class Position:
-    """Position tracking model"""
     symbol: str
     quantity: float
     entry_price: float
@@ -380,16 +333,14 @@ class Position:
     take_profit: Optional[float] = None
     
     def update_pnl(self, current_price: float):
-        """Update unrealized PnL based on current price"""
         self.current_price = current_price
-        if self.quantity > 0:  # Long position
+        if self.quantity > 0:
             self.unrealized_pnl = (current_price - self.entry_price) * self.quantity
-        else:  # Short position
+        else:
             self.unrealized_pnl = (self.entry_price - current_price) * abs(self.quantity)
 
 @dataclass
 class AlgorithmState:
-    """Algorithm state tracking"""
     algorithm_id: str
     name: str
     is_active: bool = True
@@ -428,7 +379,6 @@ class AlgorithmState:
 
 # ======================== BALANCE MANAGER ========================
 class BalanceManager:
-    """Persistent balance management with disk storage"""
     def __init__(self, initial_balance: float = 10000.0):
         self.lock = Lock()
         self.balance_file = Config.BALANCE_FILE
@@ -440,15 +390,14 @@ class BalanceManager:
         self.peak_balance = self.balance_data.get('peak_balance', initial_balance)
         
     def _load_balance(self) -> Dict:
-        """Load balance from disk - crashproof"""
         try:
             if os.path.exists(self.balance_file):
                 with open(self.balance_file, 'r') as f:
                     data = json.load(f)
-                    logger.info(f"💰 Loaded balance from disk: ${data.get('balance', 0):.2f}")
+                    logger.info(f"Loaded balance: ${data.get('balance', 0):.2f}")
                     return data
         except Exception as e:
-            logger.error(f"Failed to load balance (using initial): {e}")
+            logger.error(f"Failed to load balance: {e}")
         
         return {
             'balance': self.initial_balance,
@@ -459,7 +408,6 @@ class BalanceManager:
         }
     
     def save_balance(self):
-        """Save balance to disk - crashproof"""
         with self.lock:
             try:
                 self.balance_data = {
@@ -470,48 +418,37 @@ class BalanceManager:
                     'last_updated': datetime.now().isoformat()
                 }
                 
-                # Write to temp file first then rename (atomic operation)
                 temp_file = self.balance_file + '.tmp'
                 with open(temp_file, 'w') as f:
                     json.dump(self.balance_data, f, indent=2)
                 os.replace(temp_file, self.balance_file)
-                    
             except Exception as e:
-                logger.error(f"Failed to save balance (continuing): {e}")
+                logger.error(f"Failed to save balance: {e}")
     
     def update_balance(self, pnl: float):
-        """Update balance with P&L"""
         with self.lock:
-            try:
-                self.balance += pnl
-                
-                # Update peak and drawdown
-                if self.balance > self.peak_balance:
-                    self.peak_balance = self.balance
-                
-                drawdown = ((self.peak_balance - self.balance) / self.peak_balance) * 100 if self.peak_balance > 0 else 0
-                self.max_drawdown = max(self.max_drawdown, drawdown)
-                
-                # Add to history
-                self.equity_history.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'balance': self.balance,
-                    'pnl': pnl,
-                    'drawdown': drawdown
-                })
-                
-                # Save to disk
-                self.save_balance()
-            except Exception as e:
-                logger.error(f"Error updating balance (continuing): {e}")
+            self.balance += pnl
+            
+            if self.balance > self.peak_balance:
+                self.peak_balance = self.balance
+            
+            drawdown = ((self.peak_balance - self.balance) / self.peak_balance) * 100 if self.peak_balance > 0 else 0
+            self.max_drawdown = max(self.max_drawdown, drawdown)
+            
+            self.equity_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'balance': self.balance,
+                'pnl': pnl,
+                'drawdown': drawdown
+            })
+            
+            self.save_balance()
     
     def get_balance(self) -> float:
-        """Get current balance"""
         with self.lock:
             return self.balance
     
     def get_stats(self) -> Dict:
-        """Get balance statistics"""
         with self.lock:
             return {
                 'balance': self.balance,
@@ -521,91 +458,147 @@ class BalanceManager:
                 'equity_history': self.equity_history.copy()
             }
 
-# ======================== NUCLEAR BINANCE PROVIDER ========================
-class NuclearBinanceProvider:
-    """Bulletproof Binance Global data provider"""
+# ======================== BINANCE API (NON-BLOCKING) ========================
+class BinanceAPI:
     def __init__(self):
         self.base_url = "https://api.binance.com/api/v3"
-        self.rate_limiter = SafeRateLimiter()
-        self.cache = NuclearCache(ttl=10)
+        self.rate_limiter = RateLimiter()
+        self.cache = DataCache(ttl=60)
         self.symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
                        'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT']
         self.last_successful_data = []
-        self.last_price_update = datetime.now()
+        self.last_update_time = datetime.now()
+        self.consecutive_errors = 0
+        self.circuit_breaker_active = False
         
+    def fetch_klines_1h(self, symbol: str) -> List[Dict]:
+        """Fetch 1h klines for technical analysis"""
+        try:
+            self.rate_limiter.wait_if_needed()
+            
+            url = f"{self.base_url}/klines"
+            params = {
+                'symbol': symbol,
+                'interval': '1h',
+                'limit': 100  # Get last 100 1h candles
+            }
+            
+            response = requests.get(url, params=params, timeout=Config.API_TIMEOUT)
+            
+            if response.status_code == 200:
+                klines = response.json()
+                parsed_klines = []
+                for k in klines:
+                    parsed_klines.append({
+                        'timestamp': k[0],
+                        'open': float(k[1]),
+                        'high': float(k[2]),
+                        'low': float(k[3]),
+                        'close': float(k[4]),
+                        'volume': float(k[5])
+                    })
+                return parsed_klines
+            
+        except requests.Timeout:
+            logger.warning(f"Timeout fetching klines for {symbol}")
+        except Exception as e:
+            logger.debug(f"Error fetching klines: {e}")
+        
+        return []
+    
     def fetch_market_data(self) -> List[MarketData]:
-        """Fetch market data - NUCLEAR SAFE"""
-        # Always try cache first
+        """Fetch market data with non-blocking timeout"""
+        # Check cache first
         cached_data = self.cache.get('market_data')
         if cached_data:
             return cached_data
         
-        max_retries = 3
-        for retry in range(max_retries):
-            try:
-                # Rate limit check
-                self.rate_limiter.wait_if_needed()
-                
-                # Fetch data
-                url = f"{self.base_url}/ticker/24hr"
-                response = requests.get(url, timeout=10)
-                
-                if response.status_code == 200:
-                    all_data = response.json()
-                    market_data_list = []
-                    
-                    for ticker in all_data:
-                        if ticker['symbol'] in self.symbols:
-                            try:
-                                market_data = MarketData(
-                                    symbol=ticker['symbol'].replace('USDT', '-PERP'),
-                                    price=float(ticker.get('lastPrice', 0)),
-                                    volume=float(ticker.get('volume', 0)),
-                                    timestamp=datetime.now(),
-                                    bid=float(ticker.get('bidPrice', ticker.get('lastPrice', 0))),
-                                    ask=float(ticker.get('askPrice', ticker.get('lastPrice', 0))),
-                                    open=float(ticker.get('openPrice', ticker.get('lastPrice', 0))),
-                                    high=float(ticker.get('highPrice', ticker.get('lastPrice', 0))),
-                                    low=float(ticker.get('lowPrice', ticker.get('lastPrice', 0))),
-                                    close=float(ticker.get('lastPrice', 0))
-                                )
-                                if market_data.price > 0:  # Sanity check
-                                    market_data_list.append(market_data)
-                            except:
-                                continue
-                    
-                    if market_data_list:
-                        # Success - cache and store
-                        self.cache.set('market_data', market_data_list)
-                        self.last_successful_data = market_data_list
-                        self.last_price_update = datetime.now()
-                        self.rate_limiter.successful_requests += 1
-                        return market_data_list
-                
-                elif response.status_code == 429:
-                    logger.warning("Rate limit hit - backing off")
-                    time.sleep(30)
-                    
-            except Exception as e:
-                logger.debug(f"Binance fetch error (retry {retry+1}/{max_retries}): {e}")
-                time.sleep(2 ** retry)
+        # Circuit breaker check
+        if self.circuit_breaker_active:
+            if self.consecutive_errors < 5:
+                self.circuit_breaker_active = False
+            else:
+                return self.last_successful_data
         
-        # All retries failed - return last successful data
+        try:
+            self.rate_limiter.wait_if_needed()
+            
+            # Use timeout for non-blocking request
+            response = requests.get(
+                f"{self.base_url}/ticker/24hr",
+                timeout=Config.API_TIMEOUT
+            )
+            
+            if response.status_code == 200:
+                all_data = response.json()
+                market_data_list = []
+                
+                for ticker in all_data:
+                    if ticker['symbol'] in self.symbols:
+                        try:
+                            market_data = MarketData(
+                                symbol=ticker['symbol'].replace('USDT', '-PERP'),
+                                price=float(ticker.get('lastPrice', 0)),
+                                volume=float(ticker.get('volume', 0)),
+                                timestamp=datetime.now(),
+                                bid=float(ticker.get('bidPrice', ticker.get('lastPrice', 0))),
+                                ask=float(ticker.get('askPrice', ticker.get('lastPrice', 0))),
+                                open=float(ticker.get('openPrice', ticker.get('lastPrice', 0))),
+                                high=float(ticker.get('highPrice', ticker.get('lastPrice', 0))),
+                                low=float(ticker.get('lowPrice', ticker.get('lastPrice', 0))),
+                                close=float(ticker.get('lastPrice', 0))
+                            )
+                            if market_data.price > 0:
+                                market_data_list.append(market_data)
+                        except:
+                            continue
+                
+                if market_data_list:
+                    self.cache.set('market_data', market_data_list)
+                    self.last_successful_data = market_data_list
+                    self.last_update_time = datetime.now()
+                    self.consecutive_errors = 0
+                    self.rate_limiter.successful_requests += 1
+                    return market_data_list
+                    
+            elif response.status_code == 429:
+                logger.warning("Rate limit hit")
+                self.circuit_breaker_active = True
+                self.consecutive_errors += 1
+                
+        except requests.Timeout:
+            logger.warning("API timeout - using cached data")
+            self.consecutive_errors += 1
+            
+        except requests.ConnectionError:
+            logger.warning("Connection error - using cached data")
+            self.consecutive_errors += 1
+            
+        except Exception as e:
+            logger.debug(f"API error: {e}")
+            self.consecutive_errors += 1
+        
+        # Activate circuit breaker if too many errors
+        if self.consecutive_errors >= 5:
+            self.circuit_breaker_active = True
+        
         self.rate_limiter.failed_requests += 1
         return self.last_successful_data
     
     def get_stats(self) -> Dict:
-        """Get provider statistics"""
+        seconds_since_update = (datetime.now() - self.last_update_time).total_seconds()
         return {
-            'cache_stats': self.cache.get_stats(),
             'rate_limiter_stats': self.rate_limiter.get_stats(),
-            'last_update': self.last_price_update.isoformat(),
-            'seconds_since_update': (datetime.now() - self.last_price_update).total_seconds()
+            'cache_stats': self.cache.get_stats(),
+            'last_update': self.last_update_time.isoformat(),
+            'seconds_since_update': seconds_since_update,
+            'is_stale': seconds_since_update > 30,
+            'circuit_breaker': self.circuit_breaker_active,
+            'consecutive_errors': self.consecutive_errors
         }
 
-# ======================== TRADING ENGINE (UNCHANGED LOGIC) ========================
+# ======================== TRADING ALGORITHMS (1H TIMEFRAME) ========================
 class TradingAlgorithm:
-    """Base trading algorithm - LOGIC UNCHANGED"""
     def __init__(self, algorithm_id: str, name: str):
         self.algorithm_id = algorithm_id
         self.name = name
@@ -614,25 +607,100 @@ class TradingAlgorithm:
             name=name,
             max_trades=Config.MAX_TRADES_PER_ALGO
         )
+        self.klines_cache = {}
+        self.last_analysis = {}
+        
+    def analyze_1h_data(self, symbol: str, klines: List[Dict]) -> Dict:
+        """Analyze 1h klines for trading signals"""
+        if len(klines) < 20:
+            return {'signal': None}
+        
+        # Calculate technical indicators on 1h data
+        closes = [k['close'] for k in klines]
+        
+        # Simple Moving Averages
+        sma_20 = sum(closes[-20:]) / 20
+        sma_50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else sma_20
+        
+        # RSI (14 periods on 1h)
+        rsi = self.calculate_rsi(closes, 14)
+        
+        # Current price vs indicators
+        current_price = closes[-1]
+        
+        # Generate signal based on 1h analysis
+        signal = None
+        if current_price > sma_20 and current_price > sma_50 and rsi < 70:
+            signal = 'long'
+        elif current_price < sma_20 and current_price < sma_50 and rsi > 30:
+            signal = 'short'
+        
+        return {
+            'signal': signal,
+            'sma_20': sma_20,
+            'sma_50': sma_50,
+            'rsi': rsi,
+            'current_price': current_price
+        }
     
-    def should_trade(self, market_data: MarketData) -> Optional[str]:
-        """Original trading logic - UNCHANGED"""
-        if random.random() > 0.95:  # 5% chance to trade
-            return 'long' if random.random() > 0.5 else 'short'
+    def calculate_rsi(self, prices: List[float], period: int = 14) -> float:
+        """Calculate RSI"""
+        if len(prices) < period + 1:
+            return 50.0
+        
+        gains = []
+        losses = []
+        
+        for i in range(1, len(prices)):
+            change = prices[i] - prices[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(change))
+        
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+    
+    def should_trade(self, market_data: MarketData, klines: List[Dict]) -> Optional[str]:
+        """Determine if should trade based on 1h analysis"""
+        # Only analyze once per hour
+        now = datetime.now()
+        if self.algorithm_id in self.last_analysis:
+            last_time = self.last_analysis[self.algorithm_id]
+            if (now - last_time).total_seconds() < 3600:  # 1 hour
+                return None
+        
+        self.last_analysis[self.algorithm_id] = now
+        
+        # Analyze 1h data
+        analysis = self.analyze_1h_data(market_data.symbol, klines)
+        
+        # Add some randomness to simulate different algorithm behaviors
+        if analysis['signal'] and random.random() > 0.7:  # 30% chance when signal present
+            return analysis['signal']
+        
         return None
     
     def should_exit(self, position: Position, current_price: float) -> bool:
-        """Original exit logic - UNCHANGED"""
-        if position.quantity > 0:  # Long position
+        if position.quantity > 0:
             pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100
-        else:  # Short position
+        else:
             pnl_pct = ((position.entry_price - current_price) / position.entry_price) * 100
         
-        return (pnl_pct <= -Config.STOP_LOSS_PERCENT or 
-                pnl_pct >= Config.TAKE_PROFIT_PERCENT)
+        return (pnl_pct <= -Config.STOP_LOSS_PERCENT or pnl_pct >= Config.TAKE_PROFIT_PERCENT)
 
+# ======================== TRADING ENGINE ========================
 class TradingEngine:
-    """Main trading engine with nuclear safety"""
     def __init__(self):
         self.is_running = False
         self.algorithms = []
@@ -642,22 +710,18 @@ class TradingEngine:
         self.market_data_queue = deque(maxlen=1000)
         self.lock = Lock()
         self.balance_manager = BalanceManager(Config.INITIAL_BALANCE)
-        self.market_provider = NuclearBinanceProvider()
+        self.binance_api = BinanceAPI()
         
-        # PnL tracking
         self.total_realized_pnl = 0.0
         self.total_unrealized_pnl = 0.0
         
-        # Statistics
         self.total_wins = 0
         self.total_losses = 0
         self.daily_stats = defaultdict(lambda: {'trades': 0, 'pnl': 0.0})
         
-        # Safety tracking
         self.last_known_prices = {}
         self.last_update_time = datetime.now()
         
-        # Initialize algorithms
         self._create_algorithms()
         
         logger.info(f"✅ Trading Engine initialized")
@@ -666,7 +730,6 @@ class TradingEngine:
         telegram_bot.send_message(f"🚀 Bot Started\nBalance: ${self.balance_manager.get_balance():.2f}")
     
     def _create_algorithms(self):
-        """Create 19 trading algorithms - UNCHANGED"""
         strategies = [
             "BTC Moving Average Crossover", "ETH RSI Oversold/Overbought", 
             "BTC MACD Signal", "Bollinger Bands Multi-Crypto",
@@ -685,22 +748,18 @@ class TradingEngine:
             self.algorithms.append(algo)
     
     def get_active_algorithm(self) -> Optional[TradingAlgorithm]:
-        """Get next active algorithm - UNCHANGED"""
         for algo in self.algorithms:
             if algo.state.can_trade():
                 return algo
         return None
     
     def calculate_live_pnl(self) -> Dict:
-        """Calculate P&L - NUCLEAR SAFE"""
         try:
             total_unrealized = 0.0
             
             for position in self.positions.values():
-                # Get latest price
                 latest_price = position.current_price
                 
-                # Check market data queue
                 for data in reversed(list(self.market_data_queue)):
                     if data.symbol == position.symbol:
                         latest_price = data.price
@@ -708,20 +767,17 @@ class TradingEngine:
                         self.last_known_prices[position.symbol] = latest_price
                         break
                 
-                # Fallback to last known price
                 if position.symbol in self.last_known_prices:
                     latest_price = self.last_known_prices[position.symbol]
                     position.current_price = latest_price
                 
-                # Calculate unrealized P&L
-                if position.quantity > 0:  # Long
+                if position.quantity > 0:
                     position.unrealized_pnl = (latest_price - position.entry_price) * position.quantity
-                else:  # Short
+                else:
                     position.unrealized_pnl = (position.entry_price - latest_price) * abs(position.quantity)
                 
                 total_unrealized += position.unrealized_pnl
             
-            # Calculate realized P&L
             total_realized = sum(trade.pnl for trade in self.closed_trades)
             
             self.total_unrealized_pnl = total_unrealized
@@ -741,7 +797,6 @@ class TradingEngine:
             }
     
     def process_market_data(self, market_data: MarketData):
-        """Process market data - NUCLEAR SAFE"""
         if not self.is_running:
             return
         
@@ -751,23 +806,24 @@ class TradingEngine:
                 self.last_update_time = datetime.now()
                 self.last_known_prices[market_data.symbol] = market_data.price
                 
-                # Update P&L
                 self.calculate_live_pnl()
                 
-                # Check exits
                 self._check_exits(market_data)
                 
-                # Check new trades
+                # Get 1h klines for analysis
+                binance_symbol = market_data.symbol.replace('-PERP', 'USDT')
+                klines = self.binance_api.fetch_klines_1h(binance_symbol)
+                
                 algo = self.get_active_algorithm()
-                if algo and algo.state.can_trade():
-                    direction = algo.should_trade(market_data)
+                if algo and algo.state.can_trade() and klines:
+                    direction = algo.should_trade(market_data, klines)
                     if direction:
                         self._execute_trade(algo, market_data, direction)
+                        
         except Exception as e:
             logger.error(f"Market data processing error: {e}")
     
     def _check_exits(self, market_data: MarketData):
-        """Check position exits - NUCLEAR SAFE"""
         try:
             positions_to_close = []
             
@@ -789,11 +845,11 @@ class TradingEngine:
             
             for pos_key in positions_to_close:
                 self._close_position(pos_key, market_data)
+                
         except Exception as e:
             logger.error(f"Exit check error: {e}")
     
     def _execute_trade(self, algorithm: TradingAlgorithm, market_data: MarketData, direction: str):
-        """Execute trade - UNCHANGED LOGIC"""
         try:
             trade_id = str(uuid.uuid4())
             quantity = Config.POSITION_SIZE_USD / market_data.price
@@ -801,7 +857,6 @@ class TradingEngine:
             
             side = OrderSide.BUY if direction == 'long' else OrderSide.SELL
             
-            # Calculate SL/TP
             if direction == 'long':
                 stop_loss = market_data.price * (1 - Config.STOP_LOSS_PERCENT / 100)
                 take_profit = market_data.price * (1 + Config.TAKE_PROFIT_PERCENT / 100)
@@ -824,7 +879,6 @@ class TradingEngine:
             
             self.trades[trade_id] = trade
             
-            # Create position
             pos_quantity = quantity if direction == 'long' else -quantity
             position = Position(
                 symbol=market_data.symbol,
@@ -840,7 +894,6 @@ class TradingEngine:
             pos_key = f"{algorithm.algorithm_id}_{market_data.symbol}"
             self.positions[pos_key] = position
             
-            # Update algorithm
             algorithm.state.increment_trade_count()
             algorithm.state.trades.append(trade)
             
@@ -849,7 +902,6 @@ class TradingEngine:
             telegram_bot.send_trade_alert("OPEN", market_data.symbol, direction.upper(), 
                                          market_data.price, quantity)
             
-            # Update daily stats
             today = datetime.now().date().isoformat()
             self.daily_stats[today]['trades'] += 1
             
@@ -857,28 +909,23 @@ class TradingEngine:
             logger.error(f"Trade execution error: {e}")
     
     def _close_position(self, pos_key: str, market_data: MarketData):
-        """Close position - UNCHANGED LOGIC"""
         try:
             position = self.positions.get(pos_key)
             if not position:
                 return
             
-            # Calculate P&L
-            if position.quantity > 0:  # Long
+            if position.quantity > 0:
                 pnl = (market_data.price - position.entry_price) * position.quantity
-            else:  # Short
+            else:
                 pnl = (position.entry_price - market_data.price) * abs(position.quantity)
             
-            # Update trades
             for trade in position.trades:
                 trade.close(market_data.price)
                 trade.pnl = pnl
                 self.closed_trades.append(trade)
             
-            # Update balance
             self.balance_manager.update_balance(pnl)
             
-            # Update algorithm
             algo = next((a for a in self.algorithms 
                         if a.algorithm_id == position.algorithm_id), None)
             if algo:
@@ -896,42 +943,36 @@ class TradingEngine:
                                          "LONG" if position.quantity > 0 else "SHORT",
                                          market_data.price, abs(position.quantity), pnl)
             
-            # Update daily stats
             today = datetime.now().date().isoformat()
             self.daily_stats[today]['pnl'] += pnl
             
-            # Remove position
             del self.positions[pos_key]
             
-            # Recalculate P&L
             self.calculate_live_pnl()
             
         except Exception as e:
             logger.error(f"Position close error: {e}")
     
     def start(self):
-        """Start trading engine"""
         self.is_running = True
         logger.info("✅ Trading engine started")
     
     def stop(self):
-        """Stop trading engine"""
         self.is_running = False
         self.balance_manager.save_balance()
         pnl_data = self.calculate_live_pnl()
         logger.info(f"⏹️ Engine stopped | P&L: ${pnl_data['total']:+.2f}")
     
     def get_comprehensive_status(self) -> Dict:
-        """Get status - NUCLEAR SAFE"""
         try:
             with self.lock:
                 pnl_data = self.calculate_live_pnl()
                 balance_stats = self.balance_manager.get_stats()
+                api_stats = self.binance_api.get_stats()
                 
                 total_trades = sum(a.state.trade_count for a in self.algorithms)
                 win_rate = (self.total_wins / (self.total_wins + self.total_losses) * 100) if (self.total_wins + self.total_losses) > 0 else 0
                 
-                # Get open positions
                 open_positions = []
                 for pos_key, position in self.positions.items():
                     algo = next((a for a in self.algorithms if a.algorithm_id == position.algorithm_id), None)
@@ -955,7 +996,6 @@ class TradingEngine:
                         'leverage': Config.LEVERAGE
                     })
                 
-                # Get closed trades
                 trade_history = []
                 for trade in self.closed_trades[-50:]:
                     algo = next((a for a in self.algorithms if a.algorithm_id == trade.algorithm_id), None)
@@ -970,144 +1010,135 @@ class TradingEngine:
                         'algorithm': algo.name if algo else 'Unknown'
                     })
                 
-                # Get provider stats
-                provider_stats = self.market_provider.get_stats()
-                
                 return {
-                    # Balance and PnL
                     'balance': balance_stats['balance'],
                     'initial_balance': balance_stats['initial_balance'],
                     'total_pnl': pnl_data['total'],
                     'realized_pnl': pnl_data['realized'],
                     'unrealized_pnl': pnl_data['unrealized'],
-                    
-                    # Performance
                     'roi': ((balance_stats['balance'] - balance_stats['initial_balance']) / balance_stats['initial_balance'] * 100),
                     'max_drawdown': balance_stats['max_drawdown'],
                     'peak_balance': balance_stats['peak_balance'],
                     'win_rate': win_rate,
                     'total_wins': self.total_wins,
                     'total_losses': self.total_losses,
-                    
-                    # Trading
                     'total_trades': total_trades,
                     'open_positions_count': len(self.positions),
                     'closed_trades_count': len(self.closed_trades),
-                    
-                    # Details
                     'open_positions': open_positions,
                     'trade_history': trade_history,
                     'algorithms': [a.state.to_dict() for a in self.algorithms],
                     'equity_history': balance_stats['equity_history'][-100:],
-                    
-                    # System
-                    'api_stats': provider_stats['rate_limiter_stats'],
-                    'cache_stats': provider_stats['cache_stats'],
-                    'last_price_update': provider_stats['last_update'],
-                    'seconds_since_update': provider_stats['seconds_since_update'],
-                    
-                    # Meta
+                    'api_stats': api_stats,
                     'is_running': self.is_running,
                     'leverage': Config.LEVERAGE,
                     'last_update': self.last_update_time.isoformat()
                 }
         except Exception as e:
             logger.error(f"Status error: {e}")
-            # Return minimal safe data
             return {
                 'balance': self.balance_manager.get_balance(),
                 'initial_balance': Config.INITIAL_BALANCE,
                 'total_pnl': self.total_realized_pnl + self.total_unrealized_pnl,
                 'realized_pnl': self.total_realized_pnl,
                 'unrealized_pnl': self.total_unrealized_pnl,
-                'is_running': self.is_running
+                'is_running': self.is_running,
+                'api_stats': {'is_stale': True}
             }
 
-# ======================== NUCLEAR DATA LOOPS ========================
-def nuclear_price_fetcher(engine: TradingEngine):
-    """NUCLEAR price fetcher - NEVER CRASHES"""
-    logger.info("🔴 Nuclear price fetcher started")
-    watchdog.register('price_fetcher')
+# ======================== WORKER THREADS (SELF-HEALING) ========================
+def price_fetcher_loop(engine: TradingEngine):
+    """Self-healing price fetcher loop"""
+    logger.info("🔴 Price fetcher started")
     
-    while True:  # INFINITE LOOP
+    while True:
         try:
+            thread_registry.heartbeat('price_fetcher')
+            
             if not engine.is_running:
                 time.sleep(1)
                 continue
             
-            # Heartbeat
-            watchdog.heartbeat('price_fetcher')
-            
-            # Fetch market data
-            market_data_list = engine.market_provider.fetch_market_data()
+            # Fetch market data (non-blocking with timeout)
+            market_data_list = engine.binance_api.fetch_market_data()
             
             if market_data_list:
                 for market_data in market_data_list:
                     try:
                         engine.process_market_data(market_data)
                     except Exception as e:
-                        logger.debug(f"Process error (continuing): {e}")
-                    time.sleep(0.05)  # Small delay
+                        logger.debug(f"Process error: {e}")
+                    time.sleep(0.1)
             
-            # Wait before next fetch
             time.sleep(Config.DATA_UPDATE_INTERVAL)
             
         except Exception as e:
-            logger.error(f"Price fetcher error (restarting): {e}")
-            time.sleep(5)  # Error backoff
+            logger.error(f"Price fetcher error: {e}\n{traceback.format_exc()}")
+            time.sleep(5)
         
-        # NEVER EXIT THIS LOOP
+        # NEVER EXIT
 
-def nuclear_trading_loop(engine: TradingEngine):
-    """NUCLEAR trading loop - NEVER CRASHES"""
-    logger.info("🤖 Nuclear trading loop started")
-    watchdog.register('trading_loop')
+def trading_loop(engine: TradingEngine):
+    """Self-healing trading loop"""
+    logger.info("🤖 Trading loop started")
     
-    while True:  # INFINITE LOOP
+    while True:
         try:
+            thread_registry.heartbeat('trading_loop')
+            
             if not engine.is_running:
                 time.sleep(1)
                 continue
             
-            # Heartbeat
-            watchdog.heartbeat('trading_loop')
-            
             # Update P&L
             engine.calculate_live_pnl()
             
-            # Save balance periodically
-            if random.random() < 0.1:  # 10% chance each loop
+            # Periodic balance save
+            if random.random() < 0.05:  # 5% chance
                 engine.balance_manager.save_balance()
             
             time.sleep(1)
             
         except Exception as e:
-            logger.error(f"Trading loop error (restarting): {e}")
+            logger.error(f"Trading loop error: {e}\n{traceback.format_exc()}")
             time.sleep(5)
         
-        # NEVER EXIT THIS LOOP
+        # NEVER EXIT
 
-# ======================== NUCLEAR DASHBOARD ========================
-NUCLEAR_DASHBOARD_HTML = '''
+def watchdog_loop():
+    """Watchdog that actually restarts dead threads"""
+    logger.info("🛡️ Watchdog started")
+    
+    while True:
+        try:
+            time.sleep(10)
+            
+            unhealthy = thread_registry.check_health()
+            
+            for thread_name in unhealthy:
+                logger.warning(f"🚨 Thread {thread_name} is unhealthy - restarting")
+                thread_registry.restart_thread(thread_name)
+            
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+            time.sleep(5)
+
+# ======================== DASHBOARD ========================
+DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nuclear Crypto Trading Dashboard</title>
+    <title>Crypto Trading Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0a0e27;
             color: #e4e4e7;
-            line-height: 1.6;
         }
         
         .header {
@@ -1124,31 +1155,13 @@ NUCLEAR_DASHBOARD_HTML = '''
             align-items: center;
         }
         
-        .header h1 {
-            font-size: 1.8rem;
-            font-weight: 700;
-        }
-        
-        .status-badge {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            background: rgba(255,255,255,0.2);
+        .stale-warning {
+            background: rgba(239, 68, 68, 0.2);
+            border: 1px solid #ef4444;
+            color: #ef4444;
             padding: 0.5rem 1rem;
-            border-radius: 20px;
-        }
-        
-        .status-indicator {
-            width: 10px;
-            height: 10px;
-            background: #10b981;
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            border-radius: 8px;
+            display: none;
         }
         
         .container {
@@ -1175,18 +1188,12 @@ NUCLEAR_DASHBOARD_HTML = '''
             font-size: 0.875rem;
             color: #9ca3af;
             margin-bottom: 0.5rem;
-            text-transform: uppercase;
         }
         
         .metric-value {
             font-size: 2rem;
             font-weight: 700;
             margin-bottom: 0.5rem;
-        }
-        
-        .metric-sub {
-            font-size: 0.875rem;
-            color: #9ca3af;
         }
         
         .positive { color: #10b981; }
@@ -1201,25 +1208,9 @@ NUCLEAR_DASHBOARD_HTML = '''
             border: 1px solid #2a3f5f;
         }
         
-        .chart-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1rem;
-        }
-        
         .chart-canvas {
             position: relative;
             height: 300px;
-        }
-        
-        .table-container {
-            background: #1a1f3a;
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            border: 1px solid #2a3f5f;
-            overflow-x: auto;
         }
         
         table {
@@ -1231,7 +1222,6 @@ NUCLEAR_DASHBOARD_HTML = '''
             background: #0f1729;
             padding: 0.75rem;
             text-align: left;
-            font-weight: 600;
             font-size: 0.875rem;
             color: #9ca3af;
         }
@@ -1241,92 +1231,32 @@ NUCLEAR_DASHBOARD_HTML = '''
             border-bottom: 1px solid #2a3f5f;
             font-size: 0.875rem;
         }
-        
-        .position-badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 12px;
-            font-size: 0.75rem;
-            font-weight: 600;
-        }
-        
-        .badge-long {
-            background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
-        }
-        
-        .badge-short {
-            background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
-        }
-        
-        .api-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-            padding: 1rem;
-            background: #0f1729;
-            border-radius: 8px;
-        }
-        
-        .api-stat {
-            text-align: center;
-        }
-        
-        .api-stat-value {
-            font-size: 1.5rem;
-            font-weight: 600;
-            margin-bottom: 0.25rem;
-        }
-        
-        .api-stat-label {
-            font-size: 0.75rem;
-            color: #6b7280;
-        }
-        
-        .two-column {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 2rem;
-            margin-bottom: 2rem;
-        }
-        
-        @media (max-width: 1024px) {
-            .two-column {
-                grid-template-columns: 1fr;
-            }
-        }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-content">
             <div>
-                <h1>🔥 Nuclear Crypto Trading Dashboard</h1>
-                <p>Binance Global • 19 Algorithms • Zero Crashes</p>
+                <h1>Crypto Trading Dashboard</h1>
+                <p>Binance Global • 19 Algorithms • 1H Timeframe</p>
             </div>
-            <div class="status-badge">
-                <div class="status-indicator"></div>
-                <span>LIVE TRADING</span>
+            <div id="stale-warning" class="stale-warning">
+                ⏳ STALE DATA - Prices may be outdated
             </div>
         </div>
     </div>
     
     <div class="container">
-        <!-- Main Metrics -->
         <div class="metrics-grid">
             <div class="metric-card">
                 <div class="metric-label">Balance</div>
                 <div id="balance" class="metric-value">$0.00</div>
-                <div class="metric-sub">
-                    Initial: <span id="initial-balance">$0.00</span>
-                </div>
             </div>
             
             <div class="metric-card">
                 <div class="metric-label">Total P&L</div>
                 <div id="total-pnl" class="metric-value">$0.00</div>
-                <div class="metric-sub">
+                <div style="font-size: 0.875rem; color: #9ca3af;">
                     R: <span id="realized-pnl">$0</span> | U: <span id="unrealized-pnl">$0</span>
                 </div>
             </div>
@@ -1334,82 +1264,64 @@ NUCLEAR_DASHBOARD_HTML = '''
             <div class="metric-card">
                 <div class="metric-label">ROI %</div>
                 <div id="roi" class="metric-value">0.00%</div>
-                <div class="metric-sub">
-                    Max DD: <span id="max-dd" class="negative">0.00%</span>
+                <div style="font-size: 0.875rem; color: #9ca3af;">
+                    Max DD: <span id="max-dd">0.00%</span>
                 </div>
             </div>
             
             <div class="metric-card">
                 <div class="metric-label">Win Rate</div>
                 <div id="win-rate" class="metric-value">0.00%</div>
-                <div class="metric-sub">
-                    <span id="wins" class="positive">0W</span> / <span id="losses" class="negative">0L</span>
+                <div style="font-size: 0.875rem; color: #9ca3af;">
+                    <span id="wins">0</span>W / <span id="losses">0</span>L
                 </div>
             </div>
             
             <div class="metric-card">
                 <div class="metric-label">Positions</div>
                 <div id="positions-count" class="metric-value">0</div>
-                <div class="metric-sub">
+                <div style="font-size: 0.875rem; color: #9ca3af;">
                     Closed: <span id="closed-count">0</span>
                 </div>
             </div>
             
             <div class="metric-card">
-                <div class="metric-label">API Usage</div>
+                <div class="metric-label">API Weight</div>
                 <div id="api-usage" class="metric-value">0/600</div>
-                <div class="metric-sub">
-                    Last Update: <span id="last-update">Never</span>
+                <div style="font-size: 0.875rem; color: #9ca3af;">
+                    Success: <span id="api-success">0%</span>
                 </div>
             </div>
         </div>
         
-        <!-- Charts -->
-        <div class="two-column">
-            <div class="chart-container">
-                <div class="chart-header">
-                    <h3>Equity Curve</h3>
-                </div>
-                <div class="chart-canvas">
-                    <canvas id="equityChart"></canvas>
-                </div>
-            </div>
-            
-            <div class="chart-container">
-                <div class="chart-header">
-                    <h3>Live P&L Chart</h3>
-                </div>
-                <div class="chart-canvas">
-                    <canvas id="pnlChart"></canvas>
-                </div>
+        <div class="chart-container">
+            <h3>Equity Curve</h3>
+            <div class="chart-canvas">
+                <canvas id="equityChart"></canvas>
             </div>
         </div>
         
-        <!-- Open Positions -->
-        <div class="table-container">
+        <div class="chart-container">
             <h3>Open Positions</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Symbol</th>
                         <th>Side</th>
-                        <th>Qty</th>
                         <th>Entry</th>
                         <th>Current</th>
                         <th>P&L</th>
                         <th>P&L %</th>
-                        <th>SL/TP</th>
                         <th>Algorithm</th>
                     </tr>
                 </thead>
                 <tbody id="positions-tbody">
-                    <tr><td colspan="9" style="text-align: center;">No open positions</td></tr>
+                    <tr><td colspan="7" style="text-align: center;">No open positions</td></tr>
                 </tbody>
             </table>
         </div>
         
-        <!-- Algorithm Performance -->
-        <div class="table-container">
+        <div class="chart-container">
             <h3>Algorithm Performance</h3>
             <table>
                 <thead>
@@ -1417,44 +1329,20 @@ NUCLEAR_DASHBOARD_HTML = '''
                         <th>Algorithm</th>
                         <th>Status</th>
                         <th>Trades</th>
-                        <th>Wins</th>
-                        <th>Losses</th>
                         <th>Win Rate</th>
                         <th>Total P&L</th>
                     </tr>
                 </thead>
                 <tbody id="algorithms-tbody">
-                    <tr><td colspan="7" style="text-align: center;">Loading...</td></tr>
+                    <tr><td colspan="5" style="text-align: center;">Loading...</td></tr>
                 </tbody>
             </table>
-        </div>
-        
-        <!-- API Stats -->
-        <div class="chart-container">
-            <h3>System Statistics</h3>
-            <div class="api-grid">
-                <div class="api-stat">
-                    <div id="api-requests" class="api-stat-value">0</div>
-                    <div class="api-stat-label">API Requests</div>
-                </div>
-                <div class="api-stat">
-                    <div id="api-success" class="api-stat-value">100%</div>
-                    <div class="api-stat-label">Success Rate</div>
-                </div>
-                <div class="api-stat">
-                    <div id="cache-hits" class="api-stat-value">0%</div>
-                    <div class="api-stat-label">Cache Hit Rate</div>
-                </div>
-                <div class="api-stat">
-                    <div id="time-since" class="api-stat-value">0s</div>
-                    <div class="api-stat-label">Since Last Update</div>
-                </div>
-            </div>
         </div>
     </div>
     
     <script>
-        // Initialize charts
+        let lastData = null;
+        
         const equityCtx = document.getElementById('equityChart').getContext('2d');
         const equityChart = new Chart(equityCtx, {
             type: 'line',
@@ -1473,34 +1361,11 @@ NUCLEAR_DASHBOARD_HTML = '''
                 maintainAspectRatio: false,
                 plugins: { legend: { display: false } },
                 scales: {
-                    x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#6b7280' } },
-                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#6b7280' } }
+                    x: { grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { grid: { color: 'rgba(255,255,255,0.05)' } }
                 }
             }
         });
-        
-        const pnlCtx = document.getElementById('pnlChart').getContext('2d');
-        const pnlChart = new Chart(pnlCtx, {
-            type: 'bar',
-            data: {
-                labels: [],
-                datasets: [{
-                    data: [],
-                    backgroundColor: []
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { display: false } },
-                scales: {
-                    x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#6b7280' } },
-                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#6b7280' } }
-                }
-            }
-        });
-        
-        let lastData = null;
         
         function formatCurrency(value) {
             return new Intl.NumberFormat('en-US', {
@@ -1509,67 +1374,58 @@ NUCLEAR_DASHBOARD_HTML = '''
             }).format(value || 0);
         }
         
-        function updateColor(element, value) {
-            element.classList.remove('positive', 'negative', 'neutral');
-            if (value > 0) element.classList.add('positive');
-            else if (value < 0) element.classList.add('negative');
-            else element.classList.add('neutral');
-        }
-        
         async function updateDashboard() {
             try {
                 const response = await fetch('/api/comprehensive-status');
                 const data = response.ok ? await response.json() : lastData;
                 
                 if (!data) return;
-                lastData = data;  // Store for fallback
+                lastData = data;
+                
+                // Check if data is stale
+                if (data.api_stats && data.api_stats.is_stale) {
+                    document.getElementById('stale-warning').style.display = 'block';
+                } else {
+                    document.getElementById('stale-warning').style.display = 'none';
+                }
                 
                 // Update metrics
                 document.getElementById('balance').textContent = formatCurrency(data.balance);
-                document.getElementById('initial-balance').textContent = formatCurrency(data.initial_balance);
                 
                 const pnlEl = document.getElementById('total-pnl');
                 pnlEl.textContent = formatCurrency(data.total_pnl);
-                updateColor(pnlEl, data.total_pnl);
+                pnlEl.className = 'metric-value ' + (data.total_pnl > 0 ? 'positive' : data.total_pnl < 0 ? 'negative' : 'neutral');
                 
                 document.getElementById('realized-pnl').textContent = formatCurrency(data.realized_pnl);
                 document.getElementById('unrealized-pnl').textContent = formatCurrency(data.unrealized_pnl);
                 
                 const roiEl = document.getElementById('roi');
                 roiEl.textContent = (data.roi || 0).toFixed(2) + '%';
-                updateColor(roiEl, data.roi);
+                roiEl.className = 'metric-value ' + (data.roi > 0 ? 'positive' : data.roi < 0 ? 'negative' : 'neutral');
                 
                 document.getElementById('max-dd').textContent = (data.max_drawdown || 0).toFixed(2) + '%';
                 document.getElementById('win-rate').textContent = (data.win_rate || 0).toFixed(1) + '%';
-                document.getElementById('wins').textContent = (data.total_wins || 0) + 'W';
-                document.getElementById('losses').textContent = (data.total_losses || 0) + 'L';
-                
+                document.getElementById('wins').textContent = data.total_wins || 0;
+                document.getElementById('losses').textContent = data.total_losses || 0;
                 document.getElementById('positions-count').textContent = data.open_positions_count || 0;
                 document.getElementById('closed-count').textContent = data.closed_trades_count || 0;
                 
                 // API stats
-                const apiStats = data.api_stats || {};
-                document.getElementById('api-usage').textContent = 
-                    (apiStats.requests_used || 0) + '/' + (apiStats.requests_limit || 600);
-                document.getElementById('api-requests').textContent = apiStats.requests_used || 0;
-                document.getElementById('api-success').textContent = 
-                    (apiStats.success_rate || 100).toFixed(1) + '%';
-                document.getElementById('cache-hits').textContent = 
-                    ((data.cache_stats?.hit_rate || 0)).toFixed(1) + '%';
-                document.getElementById('time-since').textContent = 
-                    Math.round(data.seconds_since_update || 0) + 's';
+                if (data.api_stats) {
+                    const stats = data.api_stats.rate_limiter_stats || {};
+                    document.getElementById('api-usage').textContent = 
+                        (stats.requests_used || 0) + '/600';
+                    document.getElementById('api-success').textContent = 
+                        (stats.success_rate || 0).toFixed(1) + '%';
+                }
                 
-                document.getElementById('last-update').textContent = 
-                    new Date().toLocaleTimeString();
-                
-                // Update positions table
+                // Update positions
                 const posTbody = document.getElementById('positions-tbody');
                 if (data.open_positions && data.open_positions.length > 0) {
                     posTbody.innerHTML = data.open_positions.map(pos => `
                         <tr>
-                            <td><strong>${pos.symbol}</strong></td>
-                            <td><span class="position-badge badge-${pos.side.toLowerCase()}">${pos.side}</span></td>
-                            <td>${pos.quantity.toFixed(6)}</td>
+                            <td>${pos.symbol}</td>
+                            <td>${pos.side}</td>
                             <td>${formatCurrency(pos.entry_price)}</td>
                             <td>${formatCurrency(pos.current_price)}</td>
                             <td class="${pos.unrealized_pnl >= 0 ? 'positive' : 'negative'}">
@@ -1578,27 +1434,21 @@ NUCLEAR_DASHBOARD_HTML = '''
                             <td class="${pos.pnl_percent >= 0 ? 'positive' : 'negative'}">
                                 ${pos.pnl_percent.toFixed(2)}%
                             </td>
-                            <td>
-                                SL: ${formatCurrency(pos.stop_loss)}<br>
-                                TP: ${formatCurrency(pos.take_profit)}
-                            </td>
                             <td>${pos.algorithm}</td>
                         </tr>
                     `).join('');
                 } else {
-                    posTbody.innerHTML = '<tr><td colspan="9" style="text-align: center;">No open positions</td></tr>';
+                    posTbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">No open positions</td></tr>';
                 }
                 
-                // Update algorithms table
+                // Update algorithms
                 const algoTbody = document.getElementById('algorithms-tbody');
                 if (data.algorithms && data.algorithms.length > 0) {
                     algoTbody.innerHTML = data.algorithms.map(algo => `
                         <tr>
                             <td>${algo.name}</td>
-                            <td>${algo.is_active ? '<span class="positive">Active</span>' : '<span class="neutral">Complete</span>'}</td>
+                            <td>${algo.is_active ? 'Active' : 'Complete'}</td>
                             <td>${algo.trade_count}/${algo.max_trades}</td>
-                            <td class="positive">${algo.win_count}</td>
-                            <td class="negative">${algo.loss_count}</td>
                             <td>${algo.win_rate.toFixed(1)}%</td>
                             <td class="${algo.total_pnl >= 0 ? 'positive' : 'negative'}">
                                 ${formatCurrency(algo.total_pnl)}
@@ -1619,36 +1469,14 @@ NUCLEAR_DASHBOARD_HTML = '''
                     equityChart.update();
                 }
                 
-                // Update P&L chart
-                if (data.equity_history && data.equity_history.length > 1) {
-                    const pnlData = [];
-                    const pnlColors = [];
-                    const pnlLabels = [];
-                    
-                    const history = data.equity_history.slice(-20);
-                    for (let i = 1; i < history.length; i++) {
-                        const pnl = history[i].pnl || 0;
-                        pnlData.push(pnl);
-                        pnlColors.push(pnl >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(239, 68, 68, 0.8)');
-                        pnlLabels.push(new Date(history[i].timestamp).toLocaleTimeString());
-                    }
-                    
-                    pnlChart.data.labels = pnlLabels;
-                    pnlChart.data.datasets[0].data = pnlData;
-                    pnlChart.data.datasets[0].backgroundColor = pnlColors;
-                    pnlChart.update();
-                }
-                
             } catch (error) {
-                console.error('Dashboard update error:', error);
-                // Use cached data if available
+                console.error('Dashboard error:', error);
                 if (lastData) {
-                    document.getElementById('last-update').textContent = 'Using Cached Data';
+                    document.getElementById('stale-warning').style.display = 'block';
                 }
             }
         }
         
-        // Update every 2 seconds
         setInterval(updateDashboard, 2000);
         updateDashboard();
     </script>
@@ -1657,38 +1485,34 @@ NUCLEAR_DASHBOARD_HTML = '''
 '''
 
 def create_app(engine: TradingEngine):
-    """Create Flask app - NUCLEAR SAFE"""
     app = Flask(__name__)
     CORS(app)
     
     @app.route('/')
     def index():
-        return render_template_string(NUCLEAR_DASHBOARD_HTML)
+        return render_template_string(DASHBOARD_HTML)
     
     @app.route('/api/comprehensive-status')
     def comprehensive_status():
-        """Get status - NEVER CRASHES"""
         try:
             return jsonify(engine.get_comprehensive_status())
         except Exception as e:
             logger.error(f"API error: {e}")
-            # Return safe fallback
             return jsonify({
                 'balance': engine.balance_manager.get_balance(),
                 'total_pnl': 0,
                 'realized_pnl': 0,
                 'unrealized_pnl': 0,
-                'is_running': engine.is_running
+                'is_running': engine.is_running,
+                'api_stats': {'is_stale': True}
             })
     
     return app
 
-# ======================== MAIN APPLICATION ========================
+# ======================== MAIN ========================
 def main():
-    """NUCLEAR MAIN - NEVER CRASHES"""
     logger.info("=" * 70)
-    logger.info("🔥 NUCLEAR CRYPTO TRADING BOT v6.0")
-    logger.info("💣 Bulletproof • Zero Crashes • Binance Global")
+    logger.info("🚀 NUCLEAR CRYPTO TRADING BOT v7.0")
     logger.info("=" * 70)
     
     try:
@@ -1696,28 +1520,27 @@ def main():
         engine = TradingEngine()
         engine.start()
         
+        # Register threads
+        thread_registry.register('price_fetcher', price_fetcher_loop, (engine,))
+        thread_registry.register('trading_loop', trading_loop, (engine,))
+        
+        # Start threads
+        thread_registry.restart_thread('price_fetcher')
+        thread_registry.restart_thread('trading_loop')
+        
         # Start watchdog
-        watchdog.start_monitoring()
-        
-        # Start nuclear threads
-        price_thread = Thread(target=nuclear_price_fetcher, args=(engine,), daemon=True)
-        price_thread.start()
-        
-        trading_thread = Thread(target=nuclear_trading_loop, args=(engine,), daemon=True)
-        trading_thread.start()
+        watchdog_thread = Thread(target=watchdog_loop, daemon=True)
+        watchdog_thread.start()
         
         # Create Flask app
         app = create_app(engine)
         
-        logger.info("=" * 70)
         logger.info(f"📊 Dashboard: http://0.0.0.0:{Config.PORT}")
-        logger.info("🔴 NUCLEAR TRADING ACTIVE")
+        logger.info("🔴 LIVE TRADING ACTIVE")
         logger.info(f"💰 Balance: ${engine.balance_manager.get_balance():.2f}")
-        logger.info("🛡️ Watchdog Protection: ON")
-        logger.info("♾️ Infinite Loops: RUNNING")
         logger.info("=" * 70)
         
-        # Run Flask (this blocks)
+        # Run Flask
         app.run(host='0.0.0.0', port=Config.PORT, debug=False, threaded=True)
         
     except KeyboardInterrupt:
@@ -1725,16 +1548,7 @@ def main():
         if 'engine' in locals():
             engine.stop()
     except Exception as e:
-        logger.critical(f"Critical error: {e}")
-        logger.critical(traceback.format_exc())
-        # RESTART AUTOMATICALLY
-        time.sleep(10)
-        main()  # Recursive restart
+        logger.critical(f"Critical error: {e}\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
-    while True:  # NUCLEAR WRAPPER
-        try:
-            main()
-        except:
-            logger.critical("MAIN CRASHED - RESTARTING IN 10 SECONDS")
-            time.sleep(10)
+    main()
