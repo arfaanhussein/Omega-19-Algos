@@ -98,16 +98,19 @@ class ThreadRegistry:
                 self.threads[name]['last_heartbeat'] = datetime.now()
                 
     def restart_thread(self, name: str):
-        """Kill and restart a thread"""
+        """Gracefully stop and restart a thread"""
         with self.lock:
             if name not in self.threads:
                 return
                 
             thread_info = self.threads[name]
             
-            # Try to stop old thread
+            # Stop old thread gracefully
             if thread_info['thread'] and thread_info['thread'].is_alive():
-                logger.warning(f"Cannot kill thread {name}, starting new one anyway")
+                logger.warning(f"Attempting to stop thread {name}")
+                thread_info['thread'].join(timeout=5)
+                if thread_info['thread'].is_alive():
+                    logger.warning(f"Thread {name} did not stop gracefully")
             
             # Start new thread
             new_thread = Thread(
