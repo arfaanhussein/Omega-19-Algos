@@ -5,3 +5,4 @@ aiohttp==3.8.2
 websockets==10.4
 python-dotenv==1.0.0
 pydantic==1.10.2
+multidict==5.2.0
