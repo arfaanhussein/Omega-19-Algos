@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 NUCLEAR FIXED Crypto Futures Trading Bot v7.0
 Complete single file with auto-recovery, non-blocking API, and 1h timeframe
-Production-quality rewrite with RobustMarketDataManager
+Production-quality rewrite with async RobustMarketDataManager
 """
 
 import os
@@ -16,6 +16,7 @@ import requests
 import threading
 import traceback
 import signal
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from collections import deque, defaultdict
@@ -536,7 +537,7 @@ class BalanceManager:
 
 # ======================== ROBUST MARKET DATA MANAGER ========================
 class RobustMarketDataManager:
-    """Robust market data fetching with circuit breaker and fallback"""
+    """Robust market data fetching with circuit breaker and async resilient loop"""
     
     def __init__(self):
         self.base_url = "https://api.binance.com/api/v3"
@@ -550,6 +551,7 @@ class RobustMarketDataManager:
         self.last_update_time = datetime.now()
         self.consecutive_errors = 0
         self.circuit_breaker_active = False
+        self.logger = logger
         
     def fetch_klines_1h(self, symbol: str) -> List[Dict]:
         """Fetch 1h klines for technical analysis"""
@@ -580,15 +582,15 @@ class RobustMarketDataManager:
                 return parsed_klines
             
         except requests.Timeout:
-            logger.warning(f"Timeout fetching klines for {symbol}")
+            self.logger.warning(f"Timeout fetching klines for {symbol}")
         except Exception as e:
-            logger.debug(f"Error fetching klines: {e}")
+            self.logger.debug(f"Error fetching klines: {e}")
         
         return []
     
-    def fetch_market_data(self) -> List[MarketData]:
+    async def fetch_market_data(self, symbol: str = None) -> List[MarketData]:
         """
-        Fetch market data with:
+        Async fetch market data with:
         1. Cache check
         2. Circuit breaker protection
         3. Non-blocking timeout
@@ -608,11 +610,14 @@ class RobustMarketDataManager:
         
         # Step 3: Attempt API call
         try:
-            self.rate_limiter.wait_if_needed()
-            
-            response = requests.get(
-                f"{self.base_url}/ticker/24hr",
-                timeout=Config.API_TIMEOUT
+            # Use sync requests in async context (can be improved with aiohttp)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: requests.get(
+                    f"{self.base_url}/ticker/24hr",
+                    timeout=Config.API_TIMEOUT
+                )
             )
             
             if response.status_code == 200:
@@ -648,20 +653,16 @@ class RobustMarketDataManager:
                     return market_data_list
                     
             elif response.status_code == 429:
-                logger.warning("Rate limit hit")
+                self.logger.warning("Rate limit hit")
                 self.circuit_breaker_active = True
                 self.consecutive_errors += 1
                 
-        except requests.Timeout:
-            logger.warning("API timeout - using cached data")
-            self.consecutive_errors += 1
-            
-        except requests.ConnectionError:
-            logger.warning("Connection error - using cached data")
+        except asyncio.TimeoutError:
+            self.logger.warning("API timeout - using cached data")
             self.consecutive_errors += 1
             
         except Exception as e:
-            logger.debug(f"API error: {e}")
+            self.logger.debug(f"API error: {e}")
             self.consecutive_errors += 1
         
         # Step 4: Activate circuit breaker if needed
@@ -670,6 +671,55 @@ class RobustMarketDataManager:
         
         self.rate_limiter.failed_requests += 1
         return self.last_successful_data
+    
+    async def market_data_loop(self, symbols: List[str] = None, callback=None):
+        """Resilient loop: fetch 14 symbols/cycle with 5s delay"""
+        if symbols is None:
+            symbols = [s.replace('USDT', '-PERP') for s in self.symbols]
+        
+        self.logger.info(f"🔴 Async market data loop started - {len(symbols)} symbols")
+        
+        while True:
+            try:
+                # Process symbols in batches of 14
+                for i in range(0, len(symbols), 14):
+                    batch = symbols[i:i+14]
+                    self.logger.debug(f"Fetching batch: {batch}")
+                    
+                    # Create tasks with timeout protection
+                    tasks = [
+                        asyncio.wait_for(self.fetch_market_data(), timeout=5) 
+                        for _ in batch  # We fetch all market data per call
+                    ]
+                    
+                    # Execute concurrently
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Process results
+                    successful = 0
+                    for i, res in enumerate(results):
+                        if isinstance(res, Exception):
+                            self.logger.error(f"Failed batch fetch: {res}")
+                        elif res and callback:
+                            # Process each symbol's data
+                            for market_data in res:
+                                try:
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, callback, market_data
+                                    )
+                                    successful += 1
+                                except Exception as e:
+                                    self.logger.error(f"Callback error for {market_data.symbol}: {e}")
+                    
+                    if successful > 0:
+                        self.logger.debug(f"Processed {successful} symbols successfully")
+                    
+                    # Sleep between batches
+                    await asyncio.sleep(5)
+                    
+            except Exception as e:
+                self.logger.error(f"Market data loop error: {e}")
+                await asyncio.sleep(5)
     
     def get_stats(self) -> Dict:
         """Get API statistics"""
@@ -816,6 +866,10 @@ class TradingEngine:
         
         self.last_known_prices = {}
         self.last_update_time = datetime.now()
+        
+        # Async loop control
+        self.loop = None
+        self.data_task = None
         
         self._create_algorithms()
         
@@ -1131,6 +1185,10 @@ class TradingEngine:
         self.balance_manager.save_balance()
         pnl_data = self.calculate_live_pnl()
         logger.info(f"⏹️ Engine stopped | P&L: ${pnl_data['total']:+.2f}")
+        
+        # Stop async task
+        if self.data_task and not self.data_task.done():
+            self.data_task.cancel()
     
     def get_comprehensive_status(self) -> Dict:
         """Get comprehensive engine status"""
@@ -1251,35 +1309,24 @@ class TradingEngine:
                 'api_stats': {'is_stale': True}
             }
 
-# ======================== WORKER THREADS ========================
-def price_fetcher_loop(engine: TradingEngine):
-    """Self-healing price fetcher loop"""
-    logger.info("🔴 Price fetcher started")
+# ======================== ASYNC WORKER THREADS ========================
+def run_async_data_loop(engine: TradingEngine):
+    """Run the async market data loop in a thread"""
+    async def async_wrapper():
+        await engine.market_data_manager.market_data_loop(
+            callback=engine.process_market_data
+        )
     
-    while True:
-        try:
-            thread_registry.heartbeat('price_fetcher')
-            
-            if not engine.is_running:
-                time.sleep(1)
-                continue
-            
-            # Fetch market data (non-blocking with timeout)
-            market_data_list = engine.market_data_manager.fetch_market_data()
-            
-            if market_data_list:
-                for market_data in market_data_list:
-                    try:
-                        engine.process_market_data(market_data)
-                    except Exception as e:
-                        logger.debug(f"Process error: {e}")
-                    time.sleep(0.1)
-            
-            time.sleep(Config.DATA_UPDATE_INTERVAL)
-            
-        except Exception as e:
-            logger.error(f"Price fetcher error: {e}\n{traceback.format_exc()}")
-            time.sleep(5)
+    # Create new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(async_wrapper())
+    except Exception as e:
+        logger.error(f"Async data loop error: {e}")
+    finally:
+        loop.close()
 
 def trading_loop(engine: TradingEngine):
     """Self-healing trading loop"""
@@ -1439,7 +1486,7 @@ DASHBOARD_HTML = '''
         <div class="header-content">
             <div>
                 <h1>Crypto Trading Dashboard</h1>
-                <p>Binance Global • 19 Algorithms • 1H Timeframe</p>
+                <p>Binance Global • 19 Algorithms • 1H Timeframe • Async Data Pipeline</p>
             </div>
             <div id="stale-warning" class="stale-warning">
                 ⏳ STALE DATA - Prices may be outdated
@@ -1717,7 +1764,7 @@ def create_app(engine: TradingEngine):
 def main():
     """Main application entry point"""
     logger.info("=" * 70)
-    logger.info("🚀 NUCLEAR CRYPTO TRADING BOT v7.0")
+    logger.info("🚀 NUCLEAR CRYPTO TRADING BOT v7.0 - ASYNC VERSION")
     logger.info("=" * 70)
     
     try:
@@ -1725,12 +1772,12 @@ def main():
         engine = TradingEngine()
         engine.start()
         
-        # Register worker threads
-        thread_registry.register('price_fetcher', price_fetcher_loop, (engine,))
+        # Register worker threads (async data loop + sync trading loop)
+        thread_registry.register('async_data_loop', run_async_data_loop, (engine,))
         thread_registry.register('trading_loop', trading_loop, (engine,))
         
         # Start worker threads
-        thread_registry.restart_thread('price_fetcher')
+        thread_registry.restart_thread('async_data_loop')
         thread_registry.restart_thread('trading_loop')
         
         # Start watchdog thread
@@ -1741,7 +1788,7 @@ def main():
         app = create_app(engine)
         
         logger.info(f"📊 Dashboard: http://0.0.0.0:{Config.PORT}")
-        logger.info("🔴 LIVE TRADING ACTIVE")
+        logger.info("🔴 ASYNC LIVE TRADING ACTIVE")
         logger.info(f"💰 Balance: ${engine.balance_manager.get_balance():.2f}")
         logger.info("=" * 70)
         
