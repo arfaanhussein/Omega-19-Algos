@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: your-app-name
+    env: python
+    runtime:
+      version: 3.13.4
+    region: singapore  # or your preferred region
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: BINANCE_API_KEY
+        value: your_api_key_here
+      - key: BINANCE_API_SECRET
+        value: your_api_secret_here

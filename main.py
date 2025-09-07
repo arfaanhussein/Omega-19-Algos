@@ -18,12 +18,11 @@ from typing import Dict, List, Optional, Any, Tuple
 from collections import deque, defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from binance.client import Client
+from binance import AsyncClient, BinanceSocketManager
 from binance.enums import *
-from binance.websockets import BinanceSocketManager
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -175,7 +174,8 @@ class AlgorithmState:
 # WebSocket Manager
 class WebSocketManager:
     def __init__(self):
-        self.ws_manager = BinanceSocketManager(Client(Config.BINANCE_API_KEY, Config.BINANCE_API_SECRET))
+        self.client = AsyncClient(api_key=Config.BINANCE_API_KEY, api_secret=Config.BINANCE_API_SECRET)
+        self.ws_manager = BinanceSocketManager(self.client)
         self.data_cache: Dict[str, Dict] = {}
         self.pnl_tracker = PnLTracker()
         self.ws_connections: List[WebSocket] = []
@@ -188,8 +188,28 @@ class WebSocketManager:
     async def _start_websocket(self):
         try:
             async with self.ws_manager as ws:
-                for symbol in ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'XRPUSDT']:
-                    await ws.symbol_ticker_socket(callback=self._handle_ticker, symbol=symbol)
+                # Get top 100 trading pairs by volume
+                info = await self.client.get_exchange_info()
+                symbols = [symbol['symbol'] for symbol in info['symbols'] 
+                          if symbol['symbol'].endswith('USDT') and symbol['status'] == 'TRADING']
+                
+                # Sort by 24h volume and get top 100
+                volumes = await asyncio.gather(
+                    *[self.client.get_ticker(symbol=symbol) for symbol in symbols]
+                )
+                top_100 = sorted(
+                    [(symbol, float(ticker['volume'])) for symbol, ticker in zip(symbols, volumes)],
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:100]
+                
+                symbols_to_track = [symbol for symbol, _ in top_100]
+                
+                # Subscribe to all symbols in batches of 200 (Binance limit)
+                for i in range(0, len(symbols_to_track), 200):
+                    batch = symbols_to_track[i:i+200]
+                    for symbol in batch:
+                        await ws.symbol_ticker_socket(callback=self._handle_ticker, symbol=symbol)
                 
                 while self.running:
                     await asyncio.sleep(1)
@@ -302,7 +322,7 @@ class TradingEngine:
             "Cross-Exchange Arbitrage",
             "Perpetual Funding Rate",
             "Trend Following MATIC",
-                        "Range Trading AVAX",
+            "Range Trading AVAX",
             "News Based BTC Trading",
             "Sentiment Analysis DOGE",
             "Options Delta Hedging",
@@ -325,7 +345,7 @@ class TradingEngine:
         
         # Start trading loop
         asyncio.create_task(self._trading_loop())
-        
+    
     async def _process_market_data(self):
         """Process incoming market data"""
         while self.is_running:
@@ -429,7 +449,7 @@ class TradingAlgorithm:
         )
         self.klines_cache = {}
         self.last_analysis = {}
-        
+    
     async def analyze_1h_data(self, symbol: str, klines: List[Dict]) -> Dict:
         """Analyze 1h klines for trading signals"""
         if len(klines) < 20:
@@ -464,66 +484,33 @@ class TradingAlgorithm:
         }
     
     def calculate_rsi(self, prices: List[float], period: int = 14) -> float:
-        """Calculate RSI indicator"""
-        if len(prices) < period + 1:
-            return 50.0
-        
-        gains = []
-        losses = []
-        
-        for i in range(1, len(prices)):
-            change = prices[i] - prices[i-1]
-            if change > 0:
-                gains.append(change)
-                losses.append(0)
-            else:
-                gains.append(0)
-                losses.append(abs(change))
-        
-        avg_gain = sum(gains[-period:]) / period
-        avg_loss = sum(losses[-period:]) / period
-        
-        if avg_loss == 0:
-            return 100.0
-        
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi
+    """Calculate RSI indicator"""
+    if len(prices) < period + 1:
+        return 50.0
     
-    async def should_trade(self, market_data: MarketData, klines: List[Dict]) -> Optional[str]:
-        """Determine if should trade based on 1h analysis"""
-        # Only analyze once per hour
-        now = datetime.now()
-        if self.algorithm_id in self.last_analysis:
-            last_time = self.last_analysis[self.algorithm_id]
-            if (now - last_time).total_seconds() < 3600:
-                return None
-        
-        self.last_analysis[self.algorithm_id] = now
-        
-        # Analyze 1h data
-        analysis = await self.analyze_1h_data(market_data.symbol, klines)
-        
-        # Add some randomness to simulate different algorithm behaviors
-        if analysis['signal'] and random.random() > 0.7:
-            return analysis['signal']
-        
-        return None
+    gains = []
+    losses = []
     
-    async def should_exit(self, position: Position, current_price: float) -> bool:
-        """Check if position should be closed"""
-        if position.quantity > 0:
-            pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
         else:
-            pnl_pct = ((position.entry_price - current_price) / position.entry_price) * 100
-        
-        return (
-            pnl_pct <= -Config.STOP_LOSS_PERCENT or 
-            pnl_pct >= Config.TAKE_PROFIT_PERCENT
-        )
+            gains.append(0)
+            losses.append(abs(change))
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    
+    if avg_loss == 0:
+        return 100.0
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
 
-# FastAPI Routes
 @app.on_event("startup")
 async def startup_event():
     engine = TradingEngine()
@@ -571,8 +558,7 @@ async def get_status():
     }
 
 # Dashboard HTML
-DASHBOARD_HTML = """
-<!DOCTYPE html>
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html>
 <head>
     <title>Crypto Trading Dashboard</title>
@@ -652,8 +638,7 @@ DASHBOARD_HTML = """
         };
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/")
 async def dashboard():
