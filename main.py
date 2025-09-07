@@ -2,6 +2,7 @@
 """
 NUCLEAR FIXED Crypto Futures Trading Bot v7.0
 Complete single file with auto-recovery, non-blocking API, and 1h timeframe
+Production-quality rewrite with RobustMarketDataManager
 """
 
 import os
@@ -30,6 +31,7 @@ load_dotenv()
 
 # ======================== CONFIGURATION ========================
 class Config:
+    """Central configuration management"""
     BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
     BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
     
@@ -43,7 +45,7 @@ class Config:
     MAX_TRADES_PER_ALGO = int(os.getenv('MAX_TRADES_PER_ALGO', '2'))
     
     PORT = int(os.getenv('PORT', '10000'))
-    DATA_UPDATE_INTERVAL = int(os.getenv('DATA_UPDATE_INTERVAL', '60'))  # 1 minute for 1h timeframe
+    DATA_UPDATE_INTERVAL = int(os.getenv('DATA_UPDATE_INTERVAL', '60'))
     BALANCE_FILE = 'data/balance.json'
     
     STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', '2.0'))
@@ -51,7 +53,7 @@ class Config:
     
     # Conservative Binance limits
     BINANCE_MAX_REQUESTS_PER_MIN = 600
-    API_TIMEOUT = 5  # 5 second timeout for all API calls
+    API_TIMEOUT = 5
 
 # Create data directory
 os.makedirs('data', exist_ok=True)
@@ -69,7 +71,8 @@ logger = logging.getLogger(__name__)
 
 # ======================== GLOBAL THREAD REGISTRY ========================
 class ThreadRegistry:
-    """Registry to track and restart threads"""
+    """Registry to track and restart threads with health monitoring"""
+    
     def __init__(self):
         self.threads = {}
         self.lock = Lock()
@@ -106,7 +109,11 @@ class ThreadRegistry:
                 logger.warning(f"Cannot kill thread {name}, starting new one anyway")
             
             # Start new thread
-            new_thread = Thread(target=thread_info['target'], args=thread_info['args'], daemon=True)
+            new_thread = Thread(
+                target=thread_info['target'], 
+                args=thread_info['args'], 
+                daemon=True
+            )
             new_thread.start()
             thread_info['thread'] = new_thread
             thread_info['last_heartbeat'] = datetime.now()
@@ -125,8 +132,10 @@ class ThreadRegistry:
 
 thread_registry = ThreadRegistry()
 
-# ======================== TELEGRAM ========================
+# ======================== TELEGRAM NOTIFICATIONS ========================
 class TelegramBot:
+    """Telegram bot for trade notifications"""
+    
     def __init__(self, token: str, chat_id: str):
         self.token = token
         self.chat_id = chat_id
@@ -134,20 +143,37 @@ class TelegramBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
         
     def send_message(self, message: str, parse_mode: str = 'HTML'):
+        """Send message to Telegram"""
         if not self.enabled:
             return
         try:
             url = f"{self.base_url}/sendMessage"
-            data = {'chat_id': self.chat_id, 'text': message, 'parse_mode': parse_mode}
+            data = {
+                'chat_id': self.chat_id, 
+                'text': message, 
+                'parse_mode': parse_mode
+            }
             requests.post(url, data=data, timeout=3)
         except:
             pass
     
-    def send_trade_alert(self, trade_type: str, symbol: str, side: str, price: float, quantity: float, pnl: float = None):
+    def send_trade_alert(
+        self, 
+        trade_type: str, 
+        symbol: str, 
+        side: str, 
+        price: float, 
+        quantity: float, 
+        pnl: float = None
+    ):
+        """Send formatted trade alert"""
         try:
             emoji = "🟢" if side.upper() == "LONG" else "🔴"
             message = f"<b>{emoji} {trade_type} Alert</b>\n"
-            message += f"Symbol: {symbol}\nSide: {side}\nPrice: ${price:.2f}\nQuantity: {quantity:.6f}\n"
+            message += f"Symbol: {symbol}\n"
+            message += f"Side: {side}\n"
+            message += f"Price: ${price:.2f}\n"
+            message += f"Quantity: {quantity:.6f}\n"
             if pnl is not None:
                 message += f"P&L: ${pnl:+.2f}"
             self.send_message(message)
@@ -158,6 +184,8 @@ telegram_bot = TelegramBot(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
 
 # ======================== RATE LIMITER ========================
 class RateLimiter:
+    """Rate limiting for API requests"""
+    
     def __init__(self):
         self.requests_per_min = Config.BINANCE_MAX_REQUESTS_PER_MIN
         self.requests = deque()
@@ -167,8 +195,10 @@ class RateLimiter:
         self.failed_requests = 0
         
     def can_make_request(self) -> bool:
+        """Check if request can be made within rate limits"""
         with self.lock:
             now = time.time()
+            # Remove requests older than 60 seconds
             while self.requests and self.requests[0] < now - 60:
                 self.requests.popleft()
             
@@ -179,16 +209,20 @@ class RateLimiter:
             return False
     
     def wait_if_needed(self):
+        """Wait until request can be made"""
         while not self.can_make_request():
             time.sleep(0.1)
     
     def get_stats(self) -> Dict:
+        """Get rate limiter statistics"""
         with self.lock:
             now = time.time()
             while self.requests and self.requests[0] < now - 60:
                 self.requests.popleft()
             
-            success_rate = (self.successful_requests / max(self.total_requests, 1)) * 100
+            success_rate = (
+                (self.successful_requests / max(self.total_requests, 1)) * 100
+            )
             
             return {
                 'requests_used': len(self.requests),
@@ -198,8 +232,10 @@ class RateLimiter:
                 'failed_requests': self.failed_requests
             }
 
-# ======================== CACHE ========================
+# ======================== DATA CACHE ========================
 class DataCache:
+    """Cache for API responses with TTL"""
+    
     def __init__(self, ttl: int = 60):
         self.cache = {}
         self.permanent_cache = {}
@@ -209,6 +245,7 @@ class DataCache:
         self.misses = 0
         
     def get(self, key: str) -> Optional[Any]:
+        """Get value from cache"""
         with self.lock:
             if key in self.cache:
                 data, timestamp = self.cache[key]
@@ -221,11 +258,13 @@ class DataCache:
             return self.permanent_cache.get(key)
     
     def set(self, key: str, value: Any):
+        """Set value in cache"""
         with self.lock:
             self.cache[key] = (value, time.time())
             self.permanent_cache[key] = value
     
     def get_stats(self) -> Dict:
+        """Get cache statistics"""
         total = max(self.hits + self.misses, 1)
         return {
             'hits': self.hits,
@@ -233,7 +272,7 @@ class DataCache:
             'hit_rate': (self.hits / total) * 100
         }
 
-# ======================== MODELS ========================
+# ======================== DATA MODELS ========================
 class OrderStatus(Enum):
     PENDING = "pending"
     FILLED = "filled"
@@ -256,6 +295,7 @@ class TradeStatus(Enum):
 
 @dataclass
 class Trade:
+    """Trade data model"""
     trade_id: str
     symbol: str
     side: OrderSide
@@ -273,6 +313,7 @@ class Trade:
     take_profit: Optional[float] = None
     
     def close(self, exit_price: float, exit_time: Optional[datetime] = None):
+        """Close the trade"""
         self.exit_price = exit_price
         self.exit_time = exit_time or datetime.now()
         self.status = TradeStatus.CLOSED
@@ -283,6 +324,7 @@ class Trade:
             self.pnl = (self.entry_price - exit_price) * self.quantity - self.fees
     
     def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
         return {
             'trade_id': self.trade_id,
             'symbol': self.symbol,
@@ -290,9 +332,17 @@ class Trade:
             'quantity': self.quantity,
             'entry_price': self.entry_price,
             'exit_price': self.exit_price,
-            'entry_time': self.entry_time.isoformat() if isinstance(self.entry_time, datetime) else str(self.entry_time),
+            'entry_time': (
+                self.entry_time.isoformat() 
+                if isinstance(self.entry_time, datetime) 
+                else str(self.entry_time)
+            ),
             'exit_time': self.exit_time.isoformat() if self.exit_time else None,
-            'status': self.status.value if isinstance(self.status, TradeStatus) else self.status,
+            'status': (
+                self.status.value 
+                if isinstance(self.status, TradeStatus) 
+                else self.status
+            ),
             'pnl': self.pnl,
             'algorithm_id': self.algorithm_id,
             'fees': self.fees,
@@ -302,6 +352,7 @@ class Trade:
 
 @dataclass
 class MarketData:
+    """Market data model"""
     symbol: str
     price: float
     volume: float
@@ -321,6 +372,7 @@ class MarketData:
 
 @dataclass
 class Position:
+    """Position data model"""
     symbol: str
     quantity: float
     entry_price: float
@@ -333,6 +385,7 @@ class Position:
     take_profit: Optional[float] = None
     
     def update_pnl(self, current_price: float):
+        """Update unrealized P&L"""
         self.current_price = current_price
         if self.quantity > 0:
             self.unrealized_pnl = (current_price - self.entry_price) * self.quantity
@@ -341,6 +394,7 @@ class Position:
 
 @dataclass
 class AlgorithmState:
+    """Algorithm state tracking"""
     algorithm_id: str
     name: str
     is_active: bool = True
@@ -354,16 +408,23 @@ class AlgorithmState:
     last_trade_time: Optional[datetime] = None
     
     def can_trade(self) -> bool:
+        """Check if algorithm can make more trades"""
         return self.is_active and self.trade_count < self.max_trades
     
     def increment_trade_count(self):
+        """Increment trade count and update state"""
         self.trade_count += 1
         self.last_trade_time = datetime.now()
         if self.trade_count >= self.max_trades:
             self.is_active = False
     
     def to_dict(self) -> Dict[str, Any]:
-        win_rate = (self.win_count / (self.win_count + self.loss_count) * 100) if (self.win_count + self.loss_count) > 0 else 0
+        """Convert to dictionary"""
+        win_rate = (
+            (self.win_count / (self.win_count + self.loss_count) * 100) 
+            if (self.win_count + self.loss_count) > 0 
+            else 0
+        )
         return {
             'algorithm_id': self.algorithm_id,
             'name': self.name,
@@ -374,11 +435,17 @@ class AlgorithmState:
             'win_count': self.win_count,
             'loss_count': self.loss_count,
             'win_rate': win_rate,
-            'last_trade_time': self.last_trade_time.isoformat() if self.last_trade_time else None
+            'last_trade_time': (
+                self.last_trade_time.isoformat() 
+                if self.last_trade_time 
+                else None
+            )
         }
 
 # ======================== BALANCE MANAGER ========================
 class BalanceManager:
+    """Manage trading balance and equity history"""
+    
     def __init__(self, initial_balance: float = 10000.0):
         self.lock = Lock()
         self.balance_file = Config.BALANCE_FILE
@@ -390,6 +457,7 @@ class BalanceManager:
         self.peak_balance = self.balance_data.get('peak_balance', initial_balance)
         
     def _load_balance(self) -> Dict:
+        """Load balance from file"""
         try:
             if os.path.exists(self.balance_file):
                 with open(self.balance_file, 'r') as f:
@@ -408,6 +476,7 @@ class BalanceManager:
         }
     
     def save_balance(self):
+        """Save balance to file"""
         with self.lock:
             try:
                 self.balance_data = {
@@ -426,13 +495,18 @@ class BalanceManager:
                 logger.error(f"Failed to save balance: {e}")
     
     def update_balance(self, pnl: float):
+        """Update balance with P&L"""
         with self.lock:
             self.balance += pnl
             
             if self.balance > self.peak_balance:
                 self.peak_balance = self.balance
             
-            drawdown = ((self.peak_balance - self.balance) / self.peak_balance) * 100 if self.peak_balance > 0 else 0
+            drawdown = (
+                ((self.peak_balance - self.balance) / self.peak_balance) * 100 
+                if self.peak_balance > 0 
+                else 0
+            )
             self.max_drawdown = max(self.max_drawdown, drawdown)
             
             self.equity_history.append({
@@ -445,10 +519,12 @@ class BalanceManager:
             self.save_balance()
     
     def get_balance(self) -> float:
+        """Get current balance"""
         with self.lock:
             return self.balance
     
     def get_stats(self) -> Dict:
+        """Get balance statistics"""
         with self.lock:
             return {
                 'balance': self.balance,
@@ -458,14 +534,18 @@ class BalanceManager:
                 'equity_history': self.equity_history.copy()
             }
 
-# ======================== BINANCE API (NON-BLOCKING) ========================
-class BinanceAPI:
+# ======================== ROBUST MARKET DATA MANAGER ========================
+class RobustMarketDataManager:
+    """Robust market data fetching with circuit breaker and fallback"""
+    
     def __init__(self):
         self.base_url = "https://api.binance.com/api/v3"
         self.rate_limiter = RateLimiter()
         self.cache = DataCache(ttl=60)
-        self.symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-                       'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT']
+        self.symbols = [
+            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+            'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT'
+        ]
         self.last_successful_data = []
         self.last_update_time = datetime.now()
         self.consecutive_errors = 0
@@ -480,7 +560,7 @@ class BinanceAPI:
             params = {
                 'symbol': symbol,
                 'interval': '1h',
-                'limit': 100  # Get last 100 1h candles
+                'limit': 100
             }
             
             response = requests.get(url, params=params, timeout=Config.API_TIMEOUT)
@@ -507,23 +587,29 @@ class BinanceAPI:
         return []
     
     def fetch_market_data(self) -> List[MarketData]:
-        """Fetch market data with non-blocking timeout"""
-        # Check cache first
+        """
+        Fetch market data with:
+        1. Cache check
+        2. Circuit breaker protection
+        3. Non-blocking timeout
+        4. Fallback to last successful data
+        """
+        # Step 1: Check cache first
         cached_data = self.cache.get('market_data')
         if cached_data:
             return cached_data
         
-        # Circuit breaker check
+        # Step 2: Circuit breaker check
         if self.circuit_breaker_active:
             if self.consecutive_errors < 5:
                 self.circuit_breaker_active = False
             else:
                 return self.last_successful_data
         
+        # Step 3: Attempt API call
         try:
             self.rate_limiter.wait_if_needed()
             
-            # Use timeout for non-blocking request
             response = requests.get(
                 f"{self.base_url}/ticker/24hr",
                 timeout=Config.API_TIMEOUT
@@ -578,7 +664,7 @@ class BinanceAPI:
             logger.debug(f"API error: {e}")
             self.consecutive_errors += 1
         
-        # Activate circuit breaker if too many errors
+        # Step 4: Activate circuit breaker if needed
         if self.consecutive_errors >= 5:
             self.circuit_breaker_active = True
         
@@ -586,6 +672,7 @@ class BinanceAPI:
         return self.last_successful_data
     
     def get_stats(self) -> Dict:
+        """Get API statistics"""
         seconds_since_update = (datetime.now() - self.last_update_time).total_seconds()
         return {
             'rate_limiter_stats': self.rate_limiter.get_stats(),
@@ -597,8 +684,10 @@ class BinanceAPI:
             'consecutive_errors': self.consecutive_errors
         }
 
-# ======================== TRADING ALGORITHMS (1H TIMEFRAME) ========================
+# ======================== TRADING ALGORITHMS ========================
 class TradingAlgorithm:
+    """Base trading algorithm with 1H timeframe analysis"""
+    
     def __init__(self, algorithm_id: str, name: str):
         self.algorithm_id = algorithm_id
         self.name = name
@@ -644,7 +733,7 @@ class TradingAlgorithm:
         }
     
     def calculate_rsi(self, prices: List[float], period: int = 14) -> float:
-        """Calculate RSI"""
+        """Calculate RSI indicator"""
         if len(prices) < period + 1:
             return 50.0
         
@@ -677,7 +766,7 @@ class TradingAlgorithm:
         now = datetime.now()
         if self.algorithm_id in self.last_analysis:
             last_time = self.last_analysis[self.algorithm_id]
-            if (now - last_time).total_seconds() < 3600:  # 1 hour
+            if (now - last_time).total_seconds() < 3600:
                 return None
         
         self.last_analysis[self.algorithm_id] = now
@@ -686,21 +775,27 @@ class TradingAlgorithm:
         analysis = self.analyze_1h_data(market_data.symbol, klines)
         
         # Add some randomness to simulate different algorithm behaviors
-        if analysis['signal'] and random.random() > 0.7:  # 30% chance when signal present
+        if analysis['signal'] and random.random() > 0.7:
             return analysis['signal']
         
         return None
     
     def should_exit(self, position: Position, current_price: float) -> bool:
+        """Check if position should be closed"""
         if position.quantity > 0:
             pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100
         else:
             pnl_pct = ((position.entry_price - current_price) / position.entry_price) * 100
         
-        return (pnl_pct <= -Config.STOP_LOSS_PERCENT or pnl_pct >= Config.TAKE_PROFIT_PERCENT)
+        return (
+            pnl_pct <= -Config.STOP_LOSS_PERCENT or 
+            pnl_pct >= Config.TAKE_PROFIT_PERCENT
+        )
 
 # ======================== TRADING ENGINE ========================
 class TradingEngine:
+    """Main trading engine orchestrator"""
+    
     def __init__(self):
         self.is_running = False
         self.algorithms = []
@@ -710,7 +805,7 @@ class TradingEngine:
         self.market_data_queue = deque(maxlen=1000)
         self.lock = Lock()
         self.balance_manager = BalanceManager(Config.INITIAL_BALANCE)
-        self.binance_api = BinanceAPI()
+        self.market_data_manager = RobustMarketDataManager()
         
         self.total_realized_pnl = 0.0
         self.total_unrealized_pnl = 0.0
@@ -727,19 +822,31 @@ class TradingEngine:
         logger.info(f"✅ Trading Engine initialized")
         logger.info(f"💰 Balance: ${self.balance_manager.get_balance():.2f}")
         
-        telegram_bot.send_message(f"🚀 Bot Started\nBalance: ${self.balance_manager.get_balance():.2f}")
+        telegram_bot.send_message(
+            f"🚀 Bot Started\nBalance: ${self.balance_manager.get_balance():.2f}"
+        )
     
     def _create_algorithms(self):
+        """Create all trading algorithms"""
         strategies = [
-            "BTC Moving Average Crossover", "ETH RSI Oversold/Overbought", 
-            "BTC MACD Signal", "Bollinger Bands Multi-Crypto",
-            "Volume Weighted BTC Strategy", "Mean Reversion ETH/BTC",
-            "Momentum Trading SOL", "Breakout Strategy BNB",
-            "Scalping Strategy XRP", "Swing Trading ADA",
-            "BTC/ETH Pairs Trading", "Cross-Exchange Arbitrage",
-            "Perpetual Funding Rate", "Trend Following MATIC",
-            "Range Trading AVAX", "News Based BTC Trading",
-            "Sentiment Analysis DOGE", "Options Delta Hedging",
+            "BTC Moving Average Crossover",
+            "ETH RSI Oversold/Overbought",
+            "BTC MACD Signal",
+            "Bollinger Bands Multi-Crypto",
+            "Volume Weighted BTC Strategy",
+            "Mean Reversion ETH/BTC",
+            "Momentum Trading SOL",
+            "Breakout Strategy BNB",
+            "Scalping Strategy XRP",
+            "Swing Trading ADA",
+            "BTC/ETH Pairs Trading",
+            "Cross-Exchange Arbitrage",
+            "Perpetual Funding Rate",
+            "Trend Following MATIC",
+            "Range Trading AVAX",
+            "News Based BTC Trading",
+            "Sentiment Analysis DOGE",
+            "Options Delta Hedging",
             "High Frequency BTC Micro"
         ]
         
@@ -748,18 +855,22 @@ class TradingEngine:
             self.algorithms.append(algo)
     
     def get_active_algorithm(self) -> Optional[TradingAlgorithm]:
+        """Get an active algorithm that can trade"""
         for algo in self.algorithms:
             if algo.state.can_trade():
                 return algo
         return None
     
     def calculate_live_pnl(self) -> Dict:
+        """Calculate current P&L"""
         try:
             total_unrealized = 0.0
             
+            # Update all open positions
             for position in self.positions.values():
                 latest_price = position.current_price
                 
+                # Check for latest price in queue
                 for data in reversed(list(self.market_data_queue)):
                     if data.symbol == position.symbol:
                         latest_price = data.price
@@ -767,17 +878,24 @@ class TradingEngine:
                         self.last_known_prices[position.symbol] = latest_price
                         break
                 
+                # Use last known price if available
                 if position.symbol in self.last_known_prices:
                     latest_price = self.last_known_prices[position.symbol]
                     position.current_price = latest_price
                 
+                # Calculate unrealized P&L
                 if position.quantity > 0:
-                    position.unrealized_pnl = (latest_price - position.entry_price) * position.quantity
+                    position.unrealized_pnl = (
+                        (latest_price - position.entry_price) * position.quantity
+                    )
                 else:
-                    position.unrealized_pnl = (position.entry_price - latest_price) * abs(position.quantity)
+                    position.unrealized_pnl = (
+                        (position.entry_price - latest_price) * abs(position.quantity)
+                    )
                 
                 total_unrealized += position.unrealized_pnl
             
+            # Calculate total realized P&L
             total_realized = sum(trade.pnl for trade in self.closed_trades)
             
             self.total_unrealized_pnl = total_unrealized
@@ -797,23 +915,28 @@ class TradingEngine:
             }
     
     def process_market_data(self, market_data: MarketData):
+        """Process incoming market data"""
         if not self.is_running:
             return
         
         try:
             with self.lock:
+                # Add to queue
                 self.market_data_queue.append(market_data)
                 self.last_update_time = datetime.now()
                 self.last_known_prices[market_data.symbol] = market_data.price
                 
+                # Update P&L
                 self.calculate_live_pnl()
                 
+                # Check for exits
                 self._check_exits(market_data)
                 
                 # Get 1h klines for analysis
                 binance_symbol = market_data.symbol.replace('-PERP', 'USDT')
-                klines = self.binance_api.fetch_klines_1h(binance_symbol)
+                klines = self.market_data_manager.fetch_klines_1h(binance_symbol)
                 
+                # Check for new trades
                 algo = self.get_active_algorithm()
                 if algo and algo.state.can_trade() and klines:
                     direction = algo.should_trade(market_data, klines)
@@ -824,32 +947,46 @@ class TradingEngine:
             logger.error(f"Market data processing error: {e}")
     
     def _check_exits(self, market_data: MarketData):
+        """Check if any positions should be closed"""
         try:
             positions_to_close = []
             
             for pos_key, position in self.positions.items():
                 if position.symbol == market_data.symbol:
-                    algo = next((a for a in self.algorithms 
-                               if a.algorithm_id == position.algorithm_id), None)
+                    algo = next(
+                        (a for a in self.algorithms 
+                         if a.algorithm_id == position.algorithm_id), 
+                        None
+                    )
                     
                     if algo:
                         should_exit = algo.should_exit(position, market_data.price)
                         
+                        # Check stop loss
                         if position.stop_loss and market_data.price <= position.stop_loss:
                             should_exit = True
+                        
+                        # Check take profit
                         if position.take_profit and market_data.price >= position.take_profit:
                             should_exit = True
                         
                         if should_exit:
                             positions_to_close.append(pos_key)
             
+            # Close positions
             for pos_key in positions_to_close:
                 self._close_position(pos_key, market_data)
                 
         except Exception as e:
             logger.error(f"Exit check error: {e}")
     
-    def _execute_trade(self, algorithm: TradingAlgorithm, market_data: MarketData, direction: str):
+    def _execute_trade(
+        self, 
+        algorithm: TradingAlgorithm, 
+        market_data: MarketData, 
+        direction: str
+    ):
+        """Execute a new trade"""
         try:
             trade_id = str(uuid.uuid4())
             quantity = Config.POSITION_SIZE_USD / market_data.price
@@ -857,6 +994,7 @@ class TradingEngine:
             
             side = OrderSide.BUY if direction == 'long' else OrderSide.SELL
             
+            # Calculate stop loss and take profit
             if direction == 'long':
                 stop_loss = market_data.price * (1 - Config.STOP_LOSS_PERCENT / 100)
                 take_profit = market_data.price * (1 + Config.TAKE_PROFIT_PERCENT / 100)
@@ -864,6 +1002,7 @@ class TradingEngine:
                 stop_loss = market_data.price * (1 + Config.STOP_LOSS_PERCENT / 100)
                 take_profit = market_data.price * (1 - Config.TAKE_PROFIT_PERCENT / 100)
             
+            # Create trade
             trade = Trade(
                 trade_id=trade_id,
                 symbol=market_data.symbol,
@@ -879,6 +1018,7 @@ class TradingEngine:
             
             self.trades[trade_id] = trade
             
+            # Create position
             pos_quantity = quantity if direction == 'long' else -quantity
             position = Position(
                 symbol=market_data.symbol,
@@ -894,14 +1034,24 @@ class TradingEngine:
             pos_key = f"{algorithm.algorithm_id}_{market_data.symbol}"
             self.positions[pos_key] = position
             
+            # Update algorithm state
             algorithm.state.increment_trade_count()
             algorithm.state.trades.append(trade)
             
-            logger.info(f"🔥 TRADE: {algorithm.name} {direction.upper()} {market_data.symbol} @ ${market_data.price:.2f}")
+            logger.info(
+                f"🔥 TRADE: {algorithm.name} {direction.upper()} "
+                f"{market_data.symbol} @ ${market_data.price:.2f}"
+            )
             
-            telegram_bot.send_trade_alert("OPEN", market_data.symbol, direction.upper(), 
-                                         market_data.price, quantity)
+            telegram_bot.send_trade_alert(
+                "OPEN", 
+                market_data.symbol, 
+                direction.upper(),
+                market_data.price, 
+                quantity
+            )
             
+            # Update daily stats
             today = datetime.now().date().isoformat()
             self.daily_stats[today]['trades'] += 1
             
@@ -909,25 +1059,34 @@ class TradingEngine:
             logger.error(f"Trade execution error: {e}")
     
     def _close_position(self, pos_key: str, market_data: MarketData):
+        """Close a position"""
         try:
             position = self.positions.get(pos_key)
             if not position:
                 return
             
+            # Calculate P&L
             if position.quantity > 0:
                 pnl = (market_data.price - position.entry_price) * position.quantity
             else:
                 pnl = (position.entry_price - market_data.price) * abs(position.quantity)
             
+            # Close all trades in position
             for trade in position.trades:
                 trade.close(market_data.price)
                 trade.pnl = pnl
                 self.closed_trades.append(trade)
             
+            # Update balance
             self.balance_manager.update_balance(pnl)
             
-            algo = next((a for a in self.algorithms 
-                        if a.algorithm_id == position.algorithm_id), None)
+            # Update algorithm stats
+            algo = next(
+                (a for a in self.algorithms 
+                 if a.algorithm_id == position.algorithm_id), 
+                None
+            )
+            
             if algo:
                 algo.state.total_pnl += pnl
                 if pnl > 0:
@@ -939,48 +1098,74 @@ class TradingEngine:
                 
                 logger.info(f"📊 CLOSED: {algo.name} P&L: ${pnl:+.2f}")
             
-            telegram_bot.send_trade_alert("CLOSE", position.symbol,
-                                         "LONG" if position.quantity > 0 else "SHORT",
-                                         market_data.price, abs(position.quantity), pnl)
+            telegram_bot.send_trade_alert(
+                "CLOSE", 
+                position.symbol,
+                "LONG" if position.quantity > 0 else "SHORT",
+                market_data.price, 
+                abs(position.quantity), 
+                pnl
+            )
             
+            # Update daily stats
             today = datetime.now().date().isoformat()
             self.daily_stats[today]['pnl'] += pnl
             
+            # Remove position
             del self.positions[pos_key]
             
+            # Recalculate P&L
             self.calculate_live_pnl()
             
         except Exception as e:
             logger.error(f"Position close error: {e}")
     
     def start(self):
+        """Start trading engine"""
         self.is_running = True
         logger.info("✅ Trading engine started")
     
     def stop(self):
+        """Stop trading engine"""
         self.is_running = False
         self.balance_manager.save_balance()
         pnl_data = self.calculate_live_pnl()
         logger.info(f"⏹️ Engine stopped | P&L: ${pnl_data['total']:+.2f}")
     
     def get_comprehensive_status(self) -> Dict:
+        """Get comprehensive engine status"""
         try:
             with self.lock:
                 pnl_data = self.calculate_live_pnl()
                 balance_stats = self.balance_manager.get_stats()
-                api_stats = self.binance_api.get_stats()
+                api_stats = self.market_data_manager.get_stats()
                 
                 total_trades = sum(a.state.trade_count for a in self.algorithms)
-                win_rate = (self.total_wins / (self.total_wins + self.total_losses) * 100) if (self.total_wins + self.total_losses) > 0 else 0
+                win_rate = (
+                    (self.total_wins / (self.total_wins + self.total_losses) * 100) 
+                    if (self.total_wins + self.total_losses) > 0 
+                    else 0
+                )
                 
+                # Prepare open positions data
                 open_positions = []
                 for pos_key, position in self.positions.items():
-                    algo = next((a for a in self.algorithms if a.algorithm_id == position.algorithm_id), None)
+                    algo = next(
+                        (a for a in self.algorithms 
+                         if a.algorithm_id == position.algorithm_id), 
+                        None
+                    )
                     
                     if position.quantity > 0:
-                        pnl_percent = ((position.current_price - position.entry_price) / position.entry_price * 100)
+                        pnl_percent = (
+                            (position.current_price - position.entry_price) / 
+                            position.entry_price * 100
+                        )
                     else:
-                        pnl_percent = ((position.entry_price - position.current_price) / position.entry_price * 100)
+                        pnl_percent = (
+                            (position.entry_price - position.current_price) / 
+                            position.entry_price * 100
+                        )
                     
                     open_positions.append({
                         'symbol': position.symbol,
@@ -996,17 +1181,34 @@ class TradingEngine:
                         'leverage': Config.LEVERAGE
                     })
                 
+                # Prepare trade history
                 trade_history = []
                 for trade in self.closed_trades[-50:]:
-                    algo = next((a for a in self.algorithms if a.algorithm_id == trade.algorithm_id), None)
+                    algo = next(
+                        (a for a in self.algorithms 
+                         if a.algorithm_id == trade.algorithm_id), 
+                        None
+                    )
                     trade_history.append({
                         'symbol': trade.symbol,
-                        'side': trade.side.value if hasattr(trade.side, 'value') else str(trade.side),
+                        'side': (
+                            trade.side.value 
+                            if hasattr(trade.side, 'value') 
+                            else str(trade.side)
+                        ),
                         'entry_price': trade.entry_price,
                         'exit_price': trade.exit_price,
                         'pnl': trade.pnl,
-                        'entry_time': trade.entry_time.isoformat() if trade.entry_time else None,
-                        'exit_time': trade.exit_time.isoformat() if trade.exit_time else None,
+                        'entry_time': (
+                            trade.entry_time.isoformat() 
+                            if trade.entry_time 
+                            else None
+                        ),
+                        'exit_time': (
+                            trade.exit_time.isoformat() 
+                            if trade.exit_time 
+                            else None
+                        ),
                         'algorithm': algo.name if algo else 'Unknown'
                     })
                 
@@ -1016,7 +1218,10 @@ class TradingEngine:
                     'total_pnl': pnl_data['total'],
                     'realized_pnl': pnl_data['realized'],
                     'unrealized_pnl': pnl_data['unrealized'],
-                    'roi': ((balance_stats['balance'] - balance_stats['initial_balance']) / balance_stats['initial_balance'] * 100),
+                    'roi': (
+                        (balance_stats['balance'] - balance_stats['initial_balance']) / 
+                        balance_stats['initial_balance'] * 100
+                    ),
                     'max_drawdown': balance_stats['max_drawdown'],
                     'peak_balance': balance_stats['peak_balance'],
                     'win_rate': win_rate,
@@ -1046,7 +1251,7 @@ class TradingEngine:
                 'api_stats': {'is_stale': True}
             }
 
-# ======================== WORKER THREADS (SELF-HEALING) ========================
+# ======================== WORKER THREADS ========================
 def price_fetcher_loop(engine: TradingEngine):
     """Self-healing price fetcher loop"""
     logger.info("🔴 Price fetcher started")
@@ -1060,7 +1265,7 @@ def price_fetcher_loop(engine: TradingEngine):
                 continue
             
             # Fetch market data (non-blocking with timeout)
-            market_data_list = engine.binance_api.fetch_market_data()
+            market_data_list = engine.market_data_manager.fetch_market_data()
             
             if market_data_list:
                 for market_data in market_data_list:
@@ -1075,8 +1280,6 @@ def price_fetcher_loop(engine: TradingEngine):
         except Exception as e:
             logger.error(f"Price fetcher error: {e}\n{traceback.format_exc()}")
             time.sleep(5)
-        
-        # NEVER EXIT
 
 def trading_loop(engine: TradingEngine):
     """Self-healing trading loop"""
@@ -1094,7 +1297,7 @@ def trading_loop(engine: TradingEngine):
             engine.calculate_live_pnl()
             
             # Periodic balance save
-            if random.random() < 0.05:  # 5% chance
+            if random.random() < 0.05:
                 engine.balance_manager.save_balance()
             
             time.sleep(1)
@@ -1102,11 +1305,9 @@ def trading_loop(engine: TradingEngine):
         except Exception as e:
             logger.error(f"Trading loop error: {e}\n{traceback.format_exc()}")
             time.sleep(5)
-        
-        # NEVER EXIT
 
 def watchdog_loop():
-    """Watchdog that actually restarts dead threads"""
+    """Watchdog that restarts dead threads"""
     logger.info("🛡️ Watchdog started")
     
     while True:
@@ -1123,7 +1324,7 @@ def watchdog_loop():
             logger.error(f"Watchdog error: {e}")
             time.sleep(5)
 
-# ======================== DASHBOARD ========================
+# ======================== WEB DASHBOARD ========================
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1394,14 +1595,16 @@ DASHBOARD_HTML = '''
                 
                 const pnlEl = document.getElementById('total-pnl');
                 pnlEl.textContent = formatCurrency(data.total_pnl);
-                pnlEl.className = 'metric-value ' + (data.total_pnl > 0 ? 'positive' : data.total_pnl < 0 ? 'negative' : 'neutral');
+                pnlEl.className = 'metric-value ' + 
+                    (data.total_pnl > 0 ? 'positive' : data.total_pnl < 0 ? 'negative' : 'neutral');
                 
                 document.getElementById('realized-pnl').textContent = formatCurrency(data.realized_pnl);
                 document.getElementById('unrealized-pnl').textContent = formatCurrency(data.unrealized_pnl);
                 
                 const roiEl = document.getElementById('roi');
                 roiEl.textContent = (data.roi || 0).toFixed(2) + '%';
-                roiEl.className = 'metric-value ' + (data.roi > 0 ? 'positive' : data.roi < 0 ? 'negative' : 'neutral');
+                roiEl.className = 'metric-value ' + 
+                    (data.roi > 0 ? 'positive' : data.roi < 0 ? 'negative' : 'neutral');
                 
                 document.getElementById('max-dd').textContent = (data.max_drawdown || 0).toFixed(2) + '%';
                 document.getElementById('win-rate').textContent = (data.win_rate || 0).toFixed(1) + '%';
@@ -1485,6 +1688,7 @@ DASHBOARD_HTML = '''
 '''
 
 def create_app(engine: TradingEngine):
+    """Create Flask application"""
     app = Flask(__name__)
     CORS(app)
     
@@ -1509,30 +1713,31 @@ def create_app(engine: TradingEngine):
     
     return app
 
-# ======================== MAIN ========================
+# ======================== MAIN ENTRY POINT ========================
 def main():
+    """Main application entry point"""
     logger.info("=" * 70)
     logger.info("🚀 NUCLEAR CRYPTO TRADING BOT v7.0")
     logger.info("=" * 70)
     
     try:
-        # Initialize engine
+        # Initialize trading engine
         engine = TradingEngine()
         engine.start()
         
-        # Register threads
+        # Register worker threads
         thread_registry.register('price_fetcher', price_fetcher_loop, (engine,))
         thread_registry.register('trading_loop', trading_loop, (engine,))
         
-        # Start threads
+        # Start worker threads
         thread_registry.restart_thread('price_fetcher')
         thread_registry.restart_thread('trading_loop')
         
-        # Start watchdog
+        # Start watchdog thread
         watchdog_thread = Thread(target=watchdog_loop, daemon=True)
         watchdog_thread.start()
         
-        # Create Flask app
+        # Create and configure Flask app
         app = create_app(engine)
         
         logger.info(f"📊 Dashboard: http://0.0.0.0:{Config.PORT}")
@@ -1540,11 +1745,16 @@ def main():
         logger.info(f"💰 Balance: ${engine.balance_manager.get_balance():.2f}")
         logger.info("=" * 70)
         
-        # Run Flask
-        app.run(host='0.0.0.0', port=Config.PORT, debug=False, threaded=True)
+        # Run Flask server
+        app.run(
+            host='0.0.0.0', 
+            port=Config.PORT, 
+            debug=False, 
+            threaded=True
+        )
         
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        logger.info("Shutting down gracefully...")
         if 'engine' in locals():
             engine.stop()
     except Exception as e:

@@ -1,20 +1,25 @@
-# Core Dependencies - Python 3.13.4 Compatible
-flask==3.0.0
-flask-cors==4.0.0
+# Web Framework
+Flask==3.0.3
+flask-cors==4.0.1
+Werkzeug==3.0.3
+
+# HTTP Client
 requests==2.32.3
+urllib3==2.2.2
+certifi==2024.7.4
+charset-normalizer==3.3.2
+idna==3.7
+
+# Environment Variables
 python-dotenv==1.0.1
 
-# Production Server
+# Utilities
+typing-extensions==4.12.2
+MarkupSafe==2.1.5
+Jinja2==3.1.4
+itsdangerous==2.2.0
+click==8.1.7
+blinker==1.8.2
+
+# Optional but recommended for production
 gunicorn==22.0.0
-
-# Enhanced Performance
-ujson==5.9.0
-
-# Security
-cryptography==42.0.5
-
-# Timezone Support
-pytz==2024.1
-
-# System Monitoring
-psutil==5.9.8
